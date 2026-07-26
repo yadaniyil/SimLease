@@ -1,4 +1,16 @@
-# SimLease
+<div align="center">
+  <img src="plugins/simlease/assets/simlease-icon.png" alt="SimLease icon" width="160">
+
+  <h1><strong>SimLease</strong></h1>
+
+  <p>
+    <strong>Safe, conflict-free iOS Simulator sharing for concurrent coding agents.</strong>
+    <br>
+    Kernel-backed leases, isolated Derived Data, and zero server infrastructure.
+  </p>
+</div>
+
+<br>
 
 SimLease safely shares booted iOS Simulators between concurrent coding agents on the same Mac. It uses macOS `lockf` kernel locks as the source of truth, keeps human-readable JSON lease metadata, and gives each workspace and simulator an isolated Derived Data path.
 
