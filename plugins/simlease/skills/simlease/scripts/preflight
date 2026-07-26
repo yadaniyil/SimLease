@@ -8,7 +8,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 1
 fi
 
-for command_name in jq lockf shasum uuidgen xcrun; do
+for command_name in jq lockf memory_pressure shasum sysctl uuidgen xcrun; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         missing+=("$command_name")
     fi
@@ -25,4 +25,4 @@ if ! xcrun simctl list devices -j >/dev/null 2>&1; then
     exit 1
 fi
 
-printf 'SimLease preflight passed: macOS, Xcode simctl, jq, lockf, shasum, and uuidgen are available.\n'
+printf 'SimLease preflight passed: Simulator control, locking, and memory-pressure checks are available.\n'

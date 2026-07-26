@@ -54,7 +54,7 @@ The installer runs a dependency preflight and installs to `~/.local/bin/simlease
 - Bash
 - `jq`
 - `lockf`, `shasum`, and `uuidgen` from macOS
-- At least one booted, available iOS Simulator for normal use
+- At least one available iOS Simulator device; SimLease can boot one when memory permits
 
 Check a machine without acquiring a lease:
 
@@ -69,6 +69,7 @@ LEASE_JSON="$(./bin/simlease acquire \
   --owner "agent-one" \
   --purpose "Test the settings screen" \
   --ttl 3600 \
+  --boot-if-needed \
   --json)"
 
 TOKEN="$(printf '%s' "$LEASE_JSON" | jq -r '.token')"
@@ -88,7 +89,7 @@ Available commands:
 
 ```text
 simlease acquire --owner NAME [--purpose TEXT] [--device UUID]
-                 [--ttl SECONDS] [--wait SECONDS] [--json]
+                 [--ttl SECONDS] [--wait SECONDS] [--boot-if-needed] [--json]
 simlease status [--json]
 simlease renew --token TOKEN [--ttl SECONDS] [--json]
 simlease release --token TOKEN [--json]
@@ -104,7 +105,11 @@ simlease exec --token TOKEN -- COMMAND [ARG ...]
 3. Acquisition starts a guard process that holds the lock for the lease lifetime.
 4. JSON metadata records the owner, purpose, expiry, workspace, and guard PID.
 5. A second cooperating process cannot acquire the same kernel lock.
-6. Release signals the guard; expiry or a crashed guard makes the simulator available again.
+6. When every running Simulator is busy, `--boot-if-needed` checks macOS memory pressure and a RAM-derived pool limit before starting one more device.
+7. Release signals the guard; expiry or stale-lease cleanup makes the simulator available again.
+8. If SimLease started that device, cleanup shuts it down to return its RAM. Devices that were already running are never shut down automatically.
+
+By default, a new Simulator requires at least 4 GB and 15% free memory. The pool cap is one booted Simulator below 16 GB total RAM, two below 32 GB, and three at 32 GB or more. Advanced users can tune `SIMLEASE_MIN_FREE_MEMORY_MB`, `SIMLEASE_MIN_FREE_MEMORY_PERCENT`, and `SIMLEASE_MAX_BOOTED_SIMULATORS`.
 
 Runtime state defaults to `${TMPDIR}/simlease`. Override it with `SIMLEASE_DIR` when necessary. Every cooperating process must use the same state directory.
 

@@ -31,6 +31,8 @@ def main() -> int:
     assert manifest["author"]["name"]
     assert manifest["license"] == "MIT"
     assert manifest["skills"] == "./skills/"
+    cli_version = re.search(r'^SIMLEASE_VERSION="([^"]+)"$', (SKILL / "scripts" / "simlease").read_text(), re.MULTILINE)
+    assert cli_version and cli_version.group(1) == manifest["version"]
     assert load_json(PLUGIN / "hooks" / "hooks.json")["hooks"]["PreToolUse"]
     assert (PLUGIN / "hooks" / "simlease_guard.py").stat().st_mode & 0o111
 
