@@ -1,6 +1,6 @@
 {
   "name": "simlease",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Stop coding agents from fighting over the same iOS Simulator.",
   "author": {
     "name": "Danny Yako",

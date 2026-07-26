@@ -20,6 +20,7 @@ jobs:
           bash -n bin/simlease scripts/install.sh plugins/simlease/skills/simlease/scripts/* tests/simlease-tests.sh
           shellcheck bin/simlease scripts/install.sh plugins/simlease/skills/simlease/scripts/* tests/simlease-tests.sh
           ./tests/plugin-tests.py
+          ./tests/hook-tests.py
           ./tests/simlease-tests.sh
           RELEASE_VERSION="${GITHUB_REF_NAME#v}"
           MANIFEST_VERSION="$(jq -r '.version' plugins/simlease/.codex-plugin/plugin.json)"
