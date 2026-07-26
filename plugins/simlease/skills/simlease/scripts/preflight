@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+missing=()
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+    printf 'simlease preflight: macOS is required\n' >&2
+    exit 1
+fi
+
+for command_name in jq lockf shasum uuidgen xcrun; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        missing+=("$command_name")
+    fi
+done
+
+if [[ ${#missing[@]} -gt 0 ]]; then
+    printf 'simlease preflight: missing required commands: %s\n' "${missing[*]}" >&2
+    printf 'Install Xcode command-line tools and jq, then retry.\n' >&2
+    exit 1
+fi
+
+if ! xcrun simctl list devices -j >/dev/null 2>&1; then
+    printf 'simlease preflight: xcrun simctl is unavailable; finish Xcode setup and retry\n' >&2
+    exit 1
+fi
+
+printf 'SimLease preflight passed: macOS, Xcode simctl, jq, lockf, shasum, and uuidgen are available.\n'

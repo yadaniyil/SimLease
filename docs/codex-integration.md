@@ -1,6 +1,8 @@
-# Codex integration draft
+# Codex integration policy
 
-The following policy can be adapted for a project's `AGENTS.md`. It is an instruction layer around the `simlease` CLI; the CLI and its kernel lock perform the actual coordination.
+The Codex plugin already packages this policy as the `simlease` skill. The following version is for teams that want to reinforce the same behavior in a project's `AGENTS.md` or use the standalone CLI with another agent product. The CLI and its kernel lock perform the actual coordination.
+
+When the plugin is installed, use the executable bundled beside its `SKILL.md`. When the standalone CLI is installed, use `simlease` from `PATH` as shown below.
 
 ## Acquire an exclusive simulator lease
 

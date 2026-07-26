@@ -70,6 +70,7 @@ STATUS="$("$LEASE_TOOL" status --json)"
 [[ "$(jq '[.devices[] | select(.state == "leased")] | length' <<<"$STATUS")" == '2' ]]
 [[ "$(jq -r '.devices[] | select(.lease.owner == "agent-a") | .lease.purpose' <<<"$STATUS")" == 'first test' ]]
 
+# shellcheck disable=SC2016 # Variables intentionally expand inside the leased child shell.
 EXEC_OUTPUT="$("$LEASE_TOOL" exec --token "$TOKEN_A" -- sh -c 'printf "%s|%s|%s" "$SIMULATOR_UDID" "$SIMULATOR_NAME" "$DERIVED_DATA_PATH"')"
 [[ "$EXEC_OUTPUT" == "$UDID_A|iPhone Test One|"* ]]
 

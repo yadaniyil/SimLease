@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: brew install jq shellcheck
+      - name: Verify release
+        run: |
+          bash -n bin/simlease scripts/install.sh plugins/simlease/skills/simlease/scripts/* tests/simlease-tests.sh
+          shellcheck bin/simlease scripts/install.sh plugins/simlease/skills/simlease/scripts/* tests/simlease-tests.sh
+          ./tests/plugin-tests.py
+          ./tests/simlease-tests.sh
+          RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST_VERSION="$(jq -r '.version' plugins/simlease/.codex-plugin/plugin.json)"
+          test "$RELEASE_VERSION" = "$MANIFEST_VERSION"
+      - name: Build release artifacts
+        run: |
+          RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          tar -czf "dist/simlease-${RELEASE_VERSION}-codex-plugin.tar.gz" \
+            .agents plugins LICENSE README.md
+          install -m 0755 plugins/simlease/skills/simlease/scripts/simlease \
+            "dist/simlease-${RELEASE_VERSION}"
+          (cd dist && shasum -a 256 * > SHA256SUMS)
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag

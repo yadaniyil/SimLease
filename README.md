@@ -1,12 +1,40 @@
 # SimLease
 
-SimLease is an experimental macOS command-line coordinator for sharing booted iOS Simulators between concurrent development agents.
+SimLease safely shares booted iOS Simulators between concurrent coding agents on the same Mac. It uses macOS `lockf` kernel locks as the source of truth, keeps human-readable JSON lease metadata, and gives each workspace and simulator an isolated Derived Data path.
 
-The current implementation is a standalone Bash CLI. It uses macOS `lockf` kernel locks as the source of truth, keeps human-readable JSON lease metadata, and runs a small guard process for each active lease. It does not use a database and does not depend on XcodeBuildMCP.
+The repository ships both a Codex marketplace plugin and a standalone Bash CLI. No database or MCP server is required.
 
-## Current status
+## Install the Codex plugin
 
-This repository contains the working prototype extracted from the Gallery Compressor iOS project. The lease engine and its contention tests are implemented. Homebrew packaging, the Codex plugin wrapper, release automation, and public documentation are not implemented yet.
+Give Codex this prompt:
+
+> Install the SimLease plugin from `https://github.com/yadaniyil/SimLease`, then use it for every iOS Simulator operation.
+
+Codex can perform the equivalent manual installation:
+
+```bash
+codex plugin marketplace add yadaniyil/SimLease --ref main
+codex plugin add simlease@simlease
+```
+
+Start a new Codex task after installation so the `simlease` skill is loaded. The plugin bundles the CLI; it does not require a separate Homebrew install or expect `simlease` on `PATH`.
+
+For local development, install directly from this checkout:
+
+```bash
+codex plugin marketplace add "$(pwd)"
+codex plugin add simlease@simlease
+```
+
+## Install the standalone CLI
+
+```bash
+git clone https://github.com/yadaniyil/SimLease.git
+cd SimLease
+./scripts/install.sh
+```
+
+The installer runs a dependency preflight and installs to `~/.local/bin/simlease`. Choose another prefix with `./scripts/install.sh --prefix /usr/local`.
 
 ## Requirements
 
@@ -16,11 +44,15 @@ This repository contains the working prototype extracted from the Gallery Compre
 - `lockf`, `shasum`, and `uuidgen` from macOS
 - At least one booted, available iOS Simulator for normal use
 
-## Try it locally
+Check a machine without acquiring a lease:
 
 ```bash
-./bin/simlease status
+./plugins/simlease/skills/simlease/scripts/preflight
+```
 
+## CLI usage
+
+```bash
 LEASE_JSON="$(./bin/simlease acquire \
   --owner "agent-one" \
   --purpose "Test the settings screen" \
@@ -40,14 +72,7 @@ TOKEN="$(printf '%s' "$LEASE_JSON" | jq -r '.token')"
 ./bin/simlease release --token "$TOKEN"
 ```
 
-`simlease exec` validates and renews the lease, then exports:
-
-- `SIMULATOR_UDID`
-- `SIMULATOR_NAME`
-- `DERIVED_DATA_PATH`
-- `SIMLEASE_TOKEN`
-
-## Commands
+Available commands:
 
 ```text
 simlease acquire --owner NAME [--purpose TEXT] [--device UUID]
@@ -58,36 +83,40 @@ simlease release --token TOKEN [--json]
 simlease exec --token TOKEN -- COMMAND [ARG ...]
 ```
 
+`simlease exec` validates and renews the lease, then exports `SIMULATOR_UDID`, `SIMULATOR_NAME`, `DERIVED_DATA_PATH`, and `SIMLEASE_TOKEN`.
+
 ## How coordination works
 
 1. SimLease discovers booted simulators using `simctl`.
 2. Each simulator UUID has its own `lockf` lock file.
-3. Acquisition starts a guard process that holds that lock for the lease lifetime.
+3. Acquisition starts a guard process that holds the lock for the lease lifetime.
 4. JSON metadata records the owner, purpose, expiry, workspace, and guard PID.
 5. A second cooperating process cannot acquire the same kernel lock.
-6. Release signals the guard; expiry or a crashed guard also makes the simulator available again.
+6. Release signals the guard; expiry or a crashed guard makes the simulator available again.
 
-Runtime state defaults to `${TMPDIR}/simlease`. Override it with `SIMLEASE_DIR` when necessary. Every process that needs to coordinate must use the same state directory.
+Runtime state defaults to `${TMPDIR}/simlease`. Override it with `SIMLEASE_DIR` when necessary. Every cooperating process must use the same state directory.
 
-## Important limitation
+## Limitations
 
-SimLease coordinates cooperating clients. It cannot prevent a process from bypassing SimLease and calling `xcrun simctl`, `xcodebuild`, XcodeBuildMCP, or Simulator directly. Agent integrations are therefore responsible for acquiring a lease before any simulator operation and using only the leased UUID.
+SimLease coordinates cooperating clients. It cannot prevent a process from bypassing SimLease and calling `xcrun simctl`, `xcodebuild`, XcodeBuildMCP, or Simulator directly. The Codex skill therefore instructs agents to acquire before any simulator operation and use only the leased UUID.
 
-See [docs/codex-integration.md](docs/codex-integration.md) for the current Codex instruction template.
+A live `serve-sim` helper without a matching lease is reported as `unmanaged-serve-sim` and blocks acquisition. `--allow-active-serve-sim` is reserved for an explicitly approved migration of that existing session.
 
-## Tests
+## Development and releases
+
+Run all local checks:
 
 ```bash
+bash -n bin/simlease plugins/simlease/skills/simlease/scripts/* tests/simlease-tests.sh
+./tests/plugin-tests.py
 ./tests/simlease-tests.sh
+python3 /path/to/plugin-creator/scripts/validate_plugin.py plugins/simlease
 ```
 
-The test suite covers simultaneous contention, multiple simulators, overflow refusal, renewal, release, expiry, invalid tokens, unmanaged serve-sim detection, and crashed guard cleanup.
+GitHub Actions repeats syntax, ShellCheck, plugin, and lease-engine tests on macOS. Tags matching the manifest version, such as `v0.1.0`, create a GitHub release containing a plugin archive, standalone CLI, and SHA-256 checksums.
 
-## Planned distribution
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [docs/codex-integration.md](docs/codex-integration.md).
 
-The intended public distribution has two layers:
+## License
 
-- A standalone `simlease` CLI installed through Homebrew for terminals, CI, and different agent products.
-- A thin Codex plugin that bundles or invokes the CLI and teaches Codex when to acquire, renew, and release leases.
-
-An MCP interface may be added later, but it is not required for the lease engine.
+MIT © 2026 Danny Yako

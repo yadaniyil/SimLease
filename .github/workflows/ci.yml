@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: brew install jq shellcheck
+      - name: Check Bash syntax
+        run: bash -n bin/simlease scripts/install.sh plugins/simlease/skills/simlease/scripts/* tests/simlease-tests.sh
+      - name: Run ShellCheck
+        run: shellcheck bin/simlease scripts/install.sh plugins/simlease/skills/simlease/scripts/* tests/simlease-tests.sh
+      - name: Validate Codex package
+        run: ./tests/plugin-tests.py
+      - name: Test lease engine
+        run: ./tests/simlease-tests.sh

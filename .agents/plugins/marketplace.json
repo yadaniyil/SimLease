@@ -1,0 +1,20 @@
+{
+  "name": "simlease",
+  "interface": {
+    "displayName": "SimLease"
+  },
+  "plugins": [
+    {
+      "name": "simlease",
+      "source": {
+        "source": "local",
+        "path": "./plugins/simlease"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Engineering"
+    }
+  ]
+}

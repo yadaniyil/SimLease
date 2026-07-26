@@ -1,0 +1,9 @@
+interface:
+  display_name: "SimLease"
+  short_description: "Coordinate shared iOS Simulators safely"
+  icon_small: "./assets/simlease-icon.png"
+  icon_large: "./assets/simlease-icon.png"
+  brand_color: "#0A84FF"
+  default_prompt: "Use $simlease to run this work on an exclusively leased iOS Simulator."
+policy:
+  allow_implicit_invocation: true
