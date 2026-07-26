@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f4f7ff">
+    <meta name="description" content="Open Codex and install SimLease without typing terminal commands.">
+    <meta property="og:title" content="Install SimLease in Codex">
+    <meta property="og:description" content="Give every coding task a safe iOS Simulator—without collisions.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://yadaniyil.github.io/SimLease/install/">
+    <meta property="og:image" content="https://yadaniyil.github.io/SimLease/og.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta name="twitter:card" content="summary_large_image">
+    <title>Install SimLease in Codex</title>
+    <link rel="canonical" href="https://yadaniyil.github.io/SimLease/install/">
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+        color: #172033;
+        background: #eef3ff;
+        font-synthesis: none;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        padding: 32px 20px;
+        background:
+          radial-gradient(circle at 18% 12%, rgba(97, 137, 255, 0.28), transparent 34%),
+          radial-gradient(circle at 82% 86%, rgba(153, 112, 255, 0.22), transparent 36%),
+          linear-gradient(145deg, #f8faff, #edf1ff 58%, #f8f5ff);
+      }
+
+      main {
+        width: min(100%, 720px);
+        padding: clamp(28px, 6vw, 56px);
+        border: 1px solid rgba(89, 108, 154, 0.18);
+        border-radius: 32px;
+        background: rgba(255, 255, 255, 0.84);
+        box-shadow: 0 28px 80px rgba(55, 73, 125, 0.18);
+        backdrop-filter: blur(22px);
+        -webkit-backdrop-filter: blur(22px);
+        text-align: center;
+      }
+
+      .mark {
+        position: relative;
+        width: 112px;
+        height: 92px;
+        margin: 0 auto 26px;
+      }
+
+      .phone {
+        position: absolute;
+        width: 40px;
+        height: 66px;
+        border: 3px solid #1b2d56;
+        border-radius: 11px;
+        background: linear-gradient(155deg, #79a8ff, #7768f2 55%, #b983ff);
+        box-shadow: 0 9px 18px rgba(48, 65, 120, 0.2);
+      }
+
+      .phone::before {
+        content: "";
+        position: absolute;
+        top: 5px;
+        left: 50%;
+        width: 13px;
+        height: 3px;
+        border-radius: 4px;
+        background: rgba(22, 34, 64, 0.68);
+        transform: translateX(-50%);
+      }
+
+      .phone.top { top: 0; left: 36px; z-index: 2; }
+      .phone.left { bottom: 0; left: 11px; transform: rotate(-7deg) scale(0.82); }
+      .phone.right { right: 11px; bottom: 0; transform: rotate(7deg) scale(0.82); }
+
+      .eyebrow {
+        margin: 0 0 10px;
+        color: #4868c8;
+        font-size: 13px;
+        font-weight: 750;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(38px, 8vw, 62px);
+        line-height: 0.98;
+        letter-spacing: -0.055em;
+      }
+
+      .lead {
+        max-width: 530px;
+        margin: 22px auto 30px;
+        color: #566078;
+        font-size: clamp(17px, 3vw, 20px);
+        line-height: 1.55;
+      }
+
+      .primary {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 56px;
+        padding: 0 27px;
+        border-radius: 16px;
+        color: white;
+        background: #172033;
+        box-shadow: 0 12px 28px rgba(23, 32, 51, 0.24);
+        font-size: 17px;
+        font-weight: 720;
+        text-decoration: none;
+        transition: transform 160ms ease, box-shadow 160ms ease;
+      }
+
+      .primary:hover { transform: translateY(-2px); box-shadow: 0 16px 32px rgba(23, 32, 51, 0.28); }
+      .primary:focus-visible, button:focus-visible, .repo:focus-visible { outline: 3px solid #7ba2ff; outline-offset: 4px; }
+
+      .steps {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+        margin: 34px 0 0;
+        padding: 0;
+        list-style: none;
+        text-align: left;
+      }
+
+      .steps li {
+        min-height: 108px;
+        padding: 16px;
+        border-radius: 17px;
+        background: rgba(235, 240, 255, 0.75);
+        color: #4e5972;
+        font-size: 14px;
+        line-height: 1.45;
+      }
+
+      .number {
+        display: block;
+        margin-bottom: 8px;
+        color: #4c6fd7;
+        font-weight: 800;
+      }
+
+      .fallback {
+        margin-top: 28px;
+        padding-top: 24px;
+        border-top: 1px solid rgba(89, 108, 154, 0.16);
+        color: #6a7286;
+        font-size: 14px;
+      }
+
+      button {
+        border: 0;
+        padding: 7px 10px;
+        border-radius: 9px;
+        color: #3158bd;
+        background: #eaf0ff;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      .repo { color: #3158bd; font-weight: 650; text-decoration: none; }
+      .repo:hover { text-decoration: underline; }
+
+      @media (max-width: 580px) {
+        body { padding: 16px; }
+        main { border-radius: 24px; }
+        .steps { grid-template-columns: 1fr; }
+        .steps li { min-height: auto; }
+        .primary { width: 100%; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .primary { transition: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="mark" aria-hidden="true">
+        <span class="phone top"></span>
+        <span class="phone left"></span>
+        <span class="phone right"></span>
+      </div>
+      <p class="eyebrow">SimLease for Codex</p>
+      <h1>One click.<br>Safe Simulators.</h1>
+      <p class="lead">Open Codex with everything it needs to install SimLease and stop coding agents from fighting over the same iOS Simulator.</p>
+      <a class="primary" id="open-codex" href="codex://new?prompt=Install%20the%20SimLease%20plugin%20from%20https%3A%2F%2Fgithub.com%2Fyadaniyil%2FSimLease.%20Follow%20the%20README%20installation%20instructions%2C%20verify%20the%20installed%20version%2C%20then%20tell%20me%20to%20open%20%2Fhooks%20and%20trust%20the%20SimLease%20hook%20and%20to%20start%20a%20new%20Codex%20task.">Open in Codex&nbsp; →</a>
+
+      <ol class="steps" aria-label="Installation steps">
+        <li><span class="number">01</span>Codex opens with the installation request ready.</li>
+        <li><span class="number">02</span>Press Send and let the agent install SimLease.</li>
+        <li><span class="number">03</span>Trust SimLease in <strong>/hooks</strong>, then start a new task.</li>
+      </ol>
+
+      <div class="fallback">
+        Codex didn’t open? <button id="copy-prompt" type="button">Copy installation prompt</button>
+        &nbsp;or&nbsp; <a class="repo" href="https://github.com/yadaniyil/SimLease">view the repository</a>.
+        <span id="copy-status" role="status" aria-live="polite"></span>
+      </div>
+    </main>
+
+    <script>
+      const installPrompt = "Install the SimLease plugin from https://github.com/yadaniyil/SimLease. Follow the README installation instructions, verify the installed version, then tell me to open /hooks and trust the SimLease hook and to start a new Codex task.";
+      const openLink = document.getElementById("open-codex");
+      const copyButton = document.getElementById("copy-prompt");
+      const copyStatus = document.getElementById("copy-status");
+
+      openLink.href = `codex://new?prompt=${encodeURIComponent(installPrompt)}`;
+      copyButton.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(installPrompt);
+          copyStatus.textContent = " Copied.";
+        } catch {
+          copyStatus.textContent = ` Copy this: ${installPrompt}`;
+        }
+      });
+    </script>
+  </body>
+</html>

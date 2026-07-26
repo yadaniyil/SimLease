@@ -12,11 +12,21 @@
 
 <br>
 
+<div align="center">
+  <a href="https://yadaniyil.github.io/SimLease/install/"><strong>Open SimLease in Codex →</strong></a>
+  <br>
+  <sub>No terminal commands required.</sub>
+</div>
+
+<br>
+
 SimLease safely shares booted iOS Simulators between concurrent coding agents on the same Mac. It uses macOS `lockf` kernel locks as the source of truth, keeps human-readable JSON lease metadata, and gives each workspace and simulator an isolated Derived Data path.
 
 The repository ships both a Codex marketplace plugin and a standalone Bash CLI. No database or MCP server is required.
 
 ## Install the Codex plugin
+
+The easiest option is [Open SimLease in Codex](https://yadaniyil.github.io/SimLease/install/). Press Send when Codex opens, then follow the one-time hook trust instruction.
 
 Give Codex this prompt:
 
