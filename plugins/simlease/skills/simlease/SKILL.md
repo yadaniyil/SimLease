@@ -1,6 +1,6 @@
 ---
 name: simlease
-description: Coordinate booted iOS Simulators across concurrent Codex agents with exclusive leases. Use before any simulator build, test, install, launch, screenshot, UI interaction, permission change, media injection, shutdown, XcodeBuildMCP simulator operation, or serve-sim command when multiple tasks or agents may share the same Mac.
+description: Automatically coordinate iOS Simulator access for every iOS or iPadOS task that builds, tests, installs, launches, screenshots, interacts with, changes, boots, or shuts down a Simulator. Always use before xcodebuild Simulator destinations, xcrun simctl, XcodeBuildMCP Simulator tools, or serve-sim, even when the user does not mention SimLease.
 ---
 
 # SimLease
@@ -25,6 +25,8 @@ Before the first simulator operation in a task, run `scripts/preflight`. If it f
      --json
    ```
 
+   Tell the user `🔒 Reserving an iOS Simulator for this task…` before acquisition. If acquisition waits, say `⏳ All matching Simulators are busy. I’m waiting for one to become free.`
+
 3. Retain the returned `token`, `udid`, and `derivedDataPath` for the current task. Treat the token as a secret and never commit or persist it in the project.
 4. Use only the leased UDID. Never select `booted`, a device name, or automatic simulator discovery after acquisition.
 5. Run shell operations through the lease when possible:
@@ -39,6 +41,8 @@ Before the first simulator operation in a task, run `scripts/preflight`. If it f
 
 6. Renew before a long operation with `scripts/simlease renew --token '<token>' --ttl 3600`.
 7. Release in cleanup, including after failures: `scripts/simlease release --token '<token>'`.
+
+After acquisition, tell the user which named Simulator is reserved. After cleanup, confirm that it was released. Do not expose the lease token in commentary or the final response.
 
 ## Tool-specific rules
 

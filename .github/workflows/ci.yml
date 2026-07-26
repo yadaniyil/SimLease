@@ -16,6 +16,8 @@ jobs:
       - name: Run ShellCheck
         run: shellcheck bin/simlease scripts/install.sh plugins/simlease/skills/simlease/scripts/* tests/simlease-tests.sh
       - name: Validate Codex package
-        run: ./tests/plugin-tests.py
+        run: |
+          ./tests/plugin-tests.py
+          ./tests/hook-tests.py
       - name: Test lease engine
         run: ./tests/simlease-tests.sh

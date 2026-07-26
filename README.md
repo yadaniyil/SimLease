@@ -29,7 +29,7 @@ codex plugin marketplace add yadaniyil/SimLease --ref main
 codex plugin add simlease@simlease
 ```
 
-Start a new Codex task after installation so the `simlease` skill is loaded. The plugin bundles the CLI; it does not require a separate Homebrew install or expect `simlease` on `PATH`.
+Start a new Codex task after installation so the `simlease` skill is loaded. Open `/hooks` once and trust the SimLease hook. The plugin then activates automatically for iOS Simulator work and blocks normal Codex tool calls that bypass a lease. The plugin bundles the CLI; it does not require a separate Homebrew install or expect `simlease` on `PATH`.
 
 For local development, install directly from this checkout:
 
@@ -108,9 +108,15 @@ simlease exec --token TOKEN -- COMMAND [ARG ...]
 
 Runtime state defaults to `${TMPDIR}/simlease`. Override it with `SIMLEASE_DIR` when necessary. Every cooperating process must use the same state directory.
 
+## Automatic Codex protection
+
+The skill is eligible for implicit use whenever Codex recognizes iOS Simulator work. A bundled `PreToolUse` hook also guards direct `simctl`, Simulator `xcodebuild`, `serve-sim`, and Simulator MCP calls. It tells the agent to acquire a lease instead of silently letting one task interfere with another.
+
+Codex requires each user to review and trust a newly installed or changed hook with `/hooks`. This is a one-time safety step for each hook version.
+
 ## Limitations
 
-SimLease coordinates cooperating clients. It cannot prevent a process from bypassing SimLease and calling `xcrun simctl`, `xcodebuild`, XcodeBuildMCP, or Simulator directly. The Codex skill therefore instructs agents to acquire before any simulator operation and use only the leased UUID.
+SimLease coordinates cooperating clients. Its Codex hook protects normal hooked tool calls, but it cannot police Xcode, Terminal, another agent product, disabled hooks, or specialized tool paths that do not participate in Codex hooks. Those clients must use the standalone CLI policy and the exact leased UUID.
 
 A live `serve-sim` helper without a matching lease is reported as `unmanaged-serve-sim` and blocks acquisition. `--allow-active-serve-sim` is reserved for an explicitly approved migration of that existing session.
 
