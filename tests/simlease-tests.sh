@@ -13,6 +13,71 @@ TOKEN_A=""
 TOKEN_B=""
 TOKEN_C=""
 
+SCALING_ROOT="${TEST_ROOT}/scaling"
+SCALING_STATE="${SCALING_ROOT}/device-state"
+SCALING_DEVICES=$'44444444-4444-4444-4444-444444444444\tiPhone Already Running'
+SCALING_SHUTDOWN=$'55555555-5555-5555-5555-555555555555\tiPhone On Demand'
+SCALING_BOOTED_UDID='55555555-5555-5555-5555-555555555555'
+
+(
+    export SIMLEASE_DIR="${SCALING_ROOT}/leases"
+    export SIMLEASE_DEVICES="$SCALING_DEVICES"
+    export SIMLEASE_SHUTDOWN_DEVICES="$SCALING_SHUTDOWN"
+    export SIMLEASE_TEST_DEVICE_STATE_DIR="$SCALING_STATE"
+    export SIMLEASE_TEST_TOTAL_MEMORY_MB=32768
+    export SIMLEASE_TEST_FREE_MEMORY_PERCENT=50
+    export SIMLEASE_MAX_BOOTED_SIMULATORS=2
+    mkdir -p "$SCALING_STATE"
+    BASE_TOKEN=''
+    STARTED_TOKEN=''
+    trap '[[ -z "$STARTED_TOKEN" ]] || "$LEASE_TOOL" release --token "$STARTED_TOKEN" >/dev/null 2>&1 || true; [[ -z "$BASE_TOKEN" ]] || "$LEASE_TOOL" release --token "$BASE_TOKEN" >/dev/null 2>&1 || true' EXIT
+
+    BASE_LEASE="$("$LEASE_TOOL" acquire --owner pool-holder --ttl 60 --json)"
+    BASE_TOKEN="$(jq -r '.token' <<< "$BASE_LEASE")"
+
+    STARTED_LEASE="$("$LEASE_TOOL" acquire --owner scaler --ttl 60 --boot-if-needed --json)"
+    STARTED_TOKEN="$(jq -r '.token' <<< "$STARTED_LEASE")"
+    [[ "$(jq -r '.bootedBySimLease' <<< "$STARTED_LEASE")" == 'true' ]]
+    [[ -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]]
+    RELEASED="$("$LEASE_TOOL" release --token "$STARTED_TOKEN" --json)"
+    STARTED_TOKEN=''
+    [[ "$(jq -r '.shutDown' <<< "$RELEASED")" == 'true' ]]
+    [[ ! -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]]
+
+    EXPIRING_LEASE="$("$LEASE_TOOL" acquire --owner expiry-scaler --ttl 2 --boot-if-needed --json)"
+    [[ "$(jq -r '.bootedBySimLease' <<< "$EXPIRING_LEASE")" == 'true' ]]
+    sleep 3
+    [[ ! -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]]
+
+    CRASHED_LEASE="$("$LEASE_TOOL" acquire --owner crash-scaler --ttl 60 --boot-if-needed --json)"
+    [[ "$(jq -r '.bootedBySimLease' <<< "$CRASHED_LEASE")" == 'true' ]]
+    CRASHED_GUARD="$("$LEASE_TOOL" status --json | jq -r --arg udid "$SCALING_BOOTED_UDID" '.devices[] | select(.udid == $udid) | .lease.guardPid')"
+    kill -9 "$CRASHED_GUARD"
+    sleep 1
+    "$LEASE_TOOL" status --json >/dev/null
+    [[ ! -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]]
+
+    SIMLEASE_TEST_FREE_MEMORY_PERCENT=5 \
+        "$LEASE_TOOL" acquire --owner low-memory --ttl 30 --wait 1 --boot-if-needed --json \
+        > "${SCALING_ROOT}/low-memory.json" 2> "${SCALING_ROOT}/low-memory.err" && {
+            printf 'Low-memory acquisition unexpectedly booted a Simulator\n' >&2
+            exit 1
+        }
+    grep -q 'not enough free memory' "${SCALING_ROOT}/low-memory.err"
+    [[ ! -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]]
+
+    SIMLEASE_MAX_BOOTED_SIMULATORS=1 \
+        "$LEASE_TOOL" acquire --owner capped-pool --ttl 30 --wait 1 --boot-if-needed --json \
+        > "${SCALING_ROOT}/capped.json" 2> "${SCALING_ROOT}/capped.err" && {
+            printf 'Pool-cap acquisition unexpectedly booted a Simulator\n' >&2
+            exit 1
+        }
+    grep -q 'safe booted Simulator limit' "${SCALING_ROOT}/capped.err"
+
+    "$LEASE_TOOL" release --token "$BASE_TOKEN" --json | jq -e '.shutDown == false' >/dev/null
+    BASE_TOKEN=''
+)
+
 cleanup() {
     [[ -z "$TOKEN_A" ]] || "$LEASE_TOOL" release --token "$TOKEN_A" >/dev/null 2>&1 || true
     [[ -z "$TOKEN_B" ]] || "$LEASE_TOOL" release --token "$TOKEN_B" >/dev/null 2>&1 || true

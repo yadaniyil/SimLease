@@ -21,7 +21,8 @@ Before the first simulator operation in a task, run `scripts/preflight`. If it f
      --owner '<task-or-agent-name>' \
      --purpose '<short purpose>' \
      --ttl 3600 \
-     --wait 60 \
+     --wait 120 \
+     --boot-if-needed \
      --json
    ```
 
@@ -42,7 +43,7 @@ Before the first simulator operation in a task, run `scripts/preflight`. If it f
 6. Renew before a long operation with `scripts/simlease renew --token '<token>' --ttl 3600`.
 7. Release in cleanup, including after failures: `scripts/simlease release --token '<token>'`.
 
-After acquisition, tell the user which named Simulator is reserved. After cleanup, confirm that it was released. Do not expose the lease token in commentary or the final response.
+After acquisition, tell the user which named Simulator is reserved. If `bootedBySimLease` is true, also say `🚀 Started <device> because every running Simulator was busy.` After cleanup, confirm that it was released; if release reports `shutDown: true`, say `💤 Shut down <device> to release its RAM.` Do not expose the lease token in commentary or the final response.
 
 ## Tool-specific rules
 
@@ -51,6 +52,8 @@ After acquisition, tell the user which named Simulator is reserved. After cleanu
 - For direct `xcrun simctl`, pass the exact leased UDID.
 - Do not run simulator-global destructive commands while another lease may exist.
 - If all matching simulators are leased, wait or continue non-simulator work. Never take over another lease.
+- With `--boot-if-needed`, SimLease measures memory pressure and the safe booted-device cap. It starts one shutdown Simulator only when both checks pass. Otherwise, explain that it is waiting for an existing lease.
+- SimLease shuts down only a Simulator that it started for the current lease. Never manually shut down a Simulator that was already running.
 - If status reports `unmanaged-serve-sim`, do not adopt it unless the user explicitly confirms a controlled migration; only then use `--allow-active-serve-sim`.
 
 ## Failure handling

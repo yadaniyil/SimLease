@@ -9,9 +9,12 @@ LEASE_DIR="${LEASE_ROOT}/leases"
 SIGNAL_DIR="${LEASE_ROOT}/signals"
 HANDSHAKE_DIR="${LEASE_ROOT}/handshakes"
 DERIVED_DATA_ROOT="${LEASE_ROOT}/derived-data"
+POOL_LOCK_PATH="${LOCK_DIR}/pool.lock"
 SERVE_SIM_STATE_DIR="${SIMLEASE_SERVE_SIM_STATE_DIR:-${TMPDIR:-/tmp}/serve-sim}"
 DEFAULT_TTL_SECONDS="${SIMLEASE_TTL_SECONDS:-3600}"
-SIMLEASE_VERSION="0.1.1"
+MIN_FREE_MEMORY_MB="${SIMLEASE_MIN_FREE_MEMORY_MB:-4096}"
+MIN_FREE_MEMORY_PERCENT="${SIMLEASE_MIN_FREE_MEMORY_PERCENT:-15}"
+SIMLEASE_VERSION="0.2.0"
 
 usage() {
     cat <<'EOF'
@@ -28,6 +31,7 @@ Acquire options:
   --device UUID      Claim only this booted simulator.
   --ttl SECONDS      Lease lifetime; defaults to 3600 seconds.
   --wait SECONDS     Wait for a simulator; defaults to 0.
+  --boot-if-needed   Boot one additional Simulator when the pool is busy and memory permits.
   --allow-active-serve-sim
                      Explicitly adopt a simulator with an unmanaged serve-sim helper.
   --json             Emit machine-readable JSON.
@@ -35,6 +39,9 @@ Acquire options:
 SIMLEASE_DIR overrides the shared state directory.
 SIMLEASE_WORKSPACE overrides the workspace recorded in lease metadata.
 SIMLEASE_DEVICES may contain test-only TSV device rows.
+SIMLEASE_MIN_FREE_MEMORY_MB defaults to 4096.
+SIMLEASE_MIN_FREE_MEMORY_PERCENT defaults to 15.
+SIMLEASE_MAX_BOOTED_SIMULATORS overrides the RAM-derived pool cap.
 EOF
 }
 
@@ -78,12 +85,141 @@ workspace_key() {
 booted_devices() {
     if [[ -n "${SIMLEASE_DEVICES:-}" ]]; then
         printf '%s\n' "$SIMLEASE_DEVICES"
+        test_booted_devices
         return
     fi
 
     require_command xcrun
     xcrun simctl list devices booted -j |
         jq -r '.devices | to_entries[] | .value[] | select(.state == "Booted" and .isAvailable == true) | [.udid, .name] | @tsv'
+}
+
+test_booted_devices() {
+    local marker
+    local udid
+    local device_name
+    [[ -n "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]] || return 0
+    for marker in "${SIMLEASE_TEST_DEVICE_STATE_DIR}"/*.booted; do
+        [[ -f "$marker" ]] || continue
+        udid="$(basename "$marker" .booted)"
+        device_name="$(printf '%s\n' "${SIMLEASE_SHUTDOWN_DEVICES:-}" | awk -F '\t' -v wanted="$udid" '$1 == wanted {print $2; exit}')"
+        [[ -n "$device_name" ]] && printf '%s\t%s\n' "$udid" "$device_name"
+    done
+}
+
+shutdown_devices() {
+    local runtime_identifier
+    if [[ -n "${SIMLEASE_SHUTDOWN_DEVICES:-}" ]]; then
+        if [[ -z "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]]; then
+            printf '%s\n' "$SIMLEASE_SHUTDOWN_DEVICES"
+            return
+        fi
+        while IFS=$'\t' read -r udid device_name; do
+            [[ -n "$udid" ]] || continue
+            [[ -f "${SIMLEASE_TEST_DEVICE_STATE_DIR}/${udid}.booted" ]] || printf '%s\t%s\n' "$udid" "$device_name"
+        done <<< "$SIMLEASE_SHUTDOWN_DEVICES"
+        return
+    fi
+
+    require_command xcrun
+    runtime_identifier="$(xcrun simctl list runtimes available -j | jq -r '
+        [.runtimes[] | select(.isAvailable != false and (.identifier | test("SimRuntime.iOS-")))]
+        | sort_by(.version | split(".") | map(tonumber)) | last | .identifier // empty')"
+    [[ -n "$runtime_identifier" ]] || return 0
+    xcrun simctl list devices -j | jq -r --arg runtime "$runtime_identifier" '
+        .devices[$runtime][]?
+        | select(.state == "Shutdown" and .isAvailable == true)
+        | [.udid, .name] | @tsv'
+}
+
+boot_device() {
+    local udid="$1"
+    if [[ -n "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]]; then
+        mkdir -p "$SIMLEASE_TEST_DEVICE_STATE_DIR"
+        : > "${SIMLEASE_TEST_DEVICE_STATE_DIR}/${udid}.booted"
+        return 0
+    fi
+    xcrun simctl bootstatus "$udid" -b
+}
+
+shutdown_device() {
+    local udid="$1"
+    if [[ -n "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]]; then
+        rm -f "${SIMLEASE_TEST_DEVICE_STATE_DIR}/${udid}.booted"
+        return 0
+    fi
+    xcrun simctl shutdown "$udid" >/dev/null 2>&1 || true
+}
+
+total_memory_mb() {
+    if [[ -n "${SIMLEASE_TEST_TOTAL_MEMORY_MB:-}" ]]; then
+        printf '%s\n' "$SIMLEASE_TEST_TOTAL_MEMORY_MB"
+        return
+    fi
+    printf '%s\n' $(( $(sysctl -n hw.memsize) / 1024 / 1024 ))
+}
+
+free_memory_percent() {
+    if [[ -n "${SIMLEASE_TEST_FREE_MEMORY_PERCENT:-}" ]]; then
+        printf '%s\n' "$SIMLEASE_TEST_FREE_MEMORY_PERCENT"
+        return
+    fi
+    memory_pressure -Q 2>/dev/null | awk -F ': ' '/System-wide memory free percentage/ {gsub(/%/, "", $2); print int($2); exit}'
+}
+
+max_booted_simulators() {
+    local total_mb="$1"
+    if [[ -n "${SIMLEASE_MAX_BOOTED_SIMULATORS:-}" ]]; then
+        printf '%s\n' "$SIMLEASE_MAX_BOOTED_SIMULATORS"
+    elif [[ "$total_mb" -lt 16384 ]]; then
+        printf '1\n'
+    elif [[ "$total_mb" -lt 32768 ]]; then
+        printf '2\n'
+    else
+        printf '3\n'
+    fi
+}
+
+capacity_json() {
+    local total_mb
+    local free_percent
+    local free_mb
+    local booted_count
+    local max_booted
+    local can_boot=true
+    local reason='enough-memory'
+
+    total_mb="$(total_memory_mb 2>/dev/null || printf '0')"
+    free_percent="$(free_memory_percent 2>/dev/null || printf '0')"
+    [[ "$total_mb" =~ ^[0-9]+$ ]] || total_mb=0
+    [[ "$free_percent" =~ ^[0-9]+$ ]] || free_percent=0
+    require_nonnegative_integer 'SIMLEASE_MIN_FREE_MEMORY_MB' "$MIN_FREE_MEMORY_MB"
+    require_nonnegative_integer 'SIMLEASE_MIN_FREE_MEMORY_PERCENT' "$MIN_FREE_MEMORY_PERCENT"
+    booted_count="$(booted_devices | awk 'NF {count++} END {print count+0}')"
+    max_booted="$(max_booted_simulators "$total_mb")"
+    require_positive_integer 'SIMLEASE_MAX_BOOTED_SIMULATORS' "$max_booted"
+    free_mb=$(( total_mb * free_percent / 100 ))
+
+    if [[ "$total_mb" -eq 0 || "$free_percent" -eq 0 ]]; then
+        can_boot=false
+        reason='memory-pressure-unavailable'
+    elif [[ "$booted_count" -ge "$max_booted" ]]; then
+        can_boot=false
+        reason='booted-simulator-limit'
+    elif [[ "$free_mb" -lt "$MIN_FREE_MEMORY_MB" || "$free_percent" -lt "$MIN_FREE_MEMORY_PERCENT" ]]; then
+        can_boot=false
+        reason='insufficient-free-memory'
+    fi
+
+    jq -n \
+        --argjson totalMemoryMB "$total_mb" \
+        --argjson freeMemoryMB "$free_mb" \
+        --argjson freeMemoryPercent "$free_percent" \
+        --argjson bootedSimulators "$booted_count" \
+        --argjson maxBootedSimulators "$max_booted" \
+        --argjson canBootAnother "$can_boot" \
+        --arg reason "$reason" \
+        '{totalMemoryMB:$totalMemoryMB,freeMemoryMB:$freeMemoryMB,freeMemoryPercent:$freeMemoryPercent,bootedSimulators:$bootedSimulators,maxBootedSimulators:$maxBootedSimulators,canBootAnother:$canBootAnother,reason:$reason}'
 }
 
 metadata_path_for_udid() {
@@ -136,6 +272,7 @@ cleanup_stale_metadata_under_lock() {
     local metadata
     local current_token_hash
     local guard_pid
+    local booted_by_simlease
 
     metadata="$(metadata_path_for_udid "$udid")"
     [[ -f "$metadata" ]] || return 0
@@ -144,6 +281,10 @@ cleanup_stale_metadata_under_lock() {
     guard_pid="$(jq -r '.guardPid // 0' "$metadata" 2>/dev/null || printf '0')"
     if [[ "$guard_pid" =~ ^[0-9]+$ ]] && [[ "$guard_pid" -gt 1 ]] && kill -0 "$guard_pid" 2>/dev/null; then
         return 0
+    fi
+    booted_by_simlease="$(jq -r '.bootedBySimLease // false' "$metadata" 2>/dev/null || printf 'false')"
+    if [[ "$booted_by_simlease" == "true" ]]; then
+        shutdown_device "$udid"
     fi
     rm -f "$metadata"
 }
@@ -174,10 +315,12 @@ write_metadata() {
     local lock_pid="${10}"
     local guard_pid="${11}"
     local derived_data_path="${12}"
+    local booted_by_simlease="${13}"
+    local lifecycle_state="${14}"
     local temporary="${metadata}.tmp.${guard_pid}"
 
     jq -n \
-        --argjson schemaVersion 1 \
+        --argjson schemaVersion 2 \
         --arg udid "$udid" \
         --arg deviceName "$device_name" \
         --arg owner "$owner" \
@@ -192,6 +335,8 @@ write_metadata() {
         --argjson ttlSeconds "$ttl_seconds" \
         --argjson lockPid "$lock_pid" \
         --argjson guardPid "$guard_pid" \
+        --argjson bootedBySimLease "$booted_by_simlease" \
+        --arg lifecycleState "$lifecycle_state" \
         '{
             schemaVersion: $schemaVersion,
             udid: $udid,
@@ -207,6 +352,8 @@ write_metadata() {
             ttlSeconds: $ttlSeconds,
             lockPid: $lockPid,
             guardPid: $guardPid,
+            bootedBySimLease: $bootedBySimLease,
+            lifecycleState: $lifecycleState,
             derivedDataPath: $derivedDataPath
         }' > "$temporary"
     mv "$temporary" "$metadata"
@@ -218,8 +365,15 @@ guard_cleanup() {
     local ready_file="$3"
     local acknowledged_file="$4"
     local release_file="$5"
+    local udid
+    local booted_by_simlease
 
     if [[ -f "$metadata" ]] && jq -e --arg tokenHash "$hashed_token" '.tokenHash == $tokenHash' "$metadata" >/dev/null 2>&1; then
+        udid="$(jq -r '.udid' "$metadata")"
+        booted_by_simlease="$(jq -r '.bootedBySimLease // false' "$metadata")"
+        if [[ "$booted_by_simlease" == "true" ]]; then
+            shutdown_device "$udid"
+        fi
         rm -f "$metadata"
     fi
     rm -f "$ready_file" "$acknowledged_file" "$release_file"
@@ -235,6 +389,7 @@ guard_lease() {
     local expires_epoch="$7"
     local ttl_seconds="$8"
     local derived_data_path="$9"
+    local booted_by_simlease="${10}"
     local metadata
     local ready_file="${HANDSHAKE_DIR}/${hashed_token}.ready"
     local acknowledged_file="${HANDSHAKE_DIR}/${hashed_token}.ack"
@@ -243,12 +398,24 @@ guard_lease() {
     local current_expiry
 
     metadata="$(metadata_path_for_udid "$udid")"
-    trap 'guard_cleanup "$metadata" "$hashed_token" "$ready_file" "$acknowledged_file" "$release_file"' EXIT
+    SIMLEASE_GUARD_METADATA_PATH="$metadata"
+    SIMLEASE_GUARD_TOKEN_HASH="$hashed_token"
+    SIMLEASE_GUARD_READY_FILE="$ready_file"
+    SIMLEASE_GUARD_ACK_FILE="$acknowledged_file"
+    SIMLEASE_GUARD_RELEASE_FILE="$release_file"
+    trap 'guard_cleanup "$SIMLEASE_GUARD_METADATA_PATH" "$SIMLEASE_GUARD_TOKEN_HASH" "$SIMLEASE_GUARD_READY_FILE" "$SIMLEASE_GUARD_ACK_FILE" "$SIMLEASE_GUARD_RELEASE_FILE"' EXIT
     trap 'exit 0' INT TERM HUP
 
     write_metadata \
         "$metadata" "$udid" "$device_name" "$owner" "$purpose" "$hashed_token" \
-        "$acquired_epoch" "$expires_epoch" "$ttl_seconds" "$PPID" "$$" "$derived_data_path"
+        "$acquired_epoch" "$expires_epoch" "$ttl_seconds" "$PPID" "$$" "$derived_data_path" \
+        "$booted_by_simlease" "$([[ "$booted_by_simlease" == "true" ]] && printf 'booting' || printf 'leased')"
+
+    if [[ "$booted_by_simlease" == "true" ]]; then
+        boot_device "$udid" || exit 1
+        jq '.lifecycleState = "leased"' "$metadata" > "${metadata}.booted.$$"
+        mv "${metadata}.booted.$$" "$metadata"
+    fi
     : > "$ready_file"
 
     while [[ ! -f "$acknowledged_file" ]]; do
@@ -274,6 +441,7 @@ try_acquire_device() {
     local ttl_seconds="$5"
     local output_json="$6"
     local allow_active_serve_sim="$7"
+    local booted_by_simlease="${8:-false}"
     local token
     local hashed_token
     local acquired_epoch
@@ -300,11 +468,11 @@ try_acquire_device() {
     lockf -t 0 -k "$(lock_path_for_udid "$udid")" \
         "$SCRIPT_PATH" __guard \
         "$udid" "$device_name" "$owner" "$purpose" "$hashed_token" \
-        "$acquired_epoch" "$expires_epoch" "$ttl_seconds" "$derived_data_path" \
+        "$acquired_epoch" "$expires_epoch" "$ttl_seconds" "$derived_data_path" "$booted_by_simlease" \
         >/dev/null 2>&1 &
     launcher_pid=$!
 
-    for _attempt in $(seq 1 50); do
+    for _attempt in $(seq 1 "${SIMLEASE_ACQUIRE_HANDSHAKE_ATTEMPTS:-1800}"); do
         if [[ -f "$ready_file" ]]; then
             : > "$acknowledged_file"
             if [[ "$output_json" == "true" ]]; then
@@ -316,8 +484,9 @@ try_acquire_device() {
                     --arg purpose "$purpose" \
                     --arg derivedDataPath "$derived_data_path" \
                     --arg expiresAt "$(utc_timestamp "$expires_epoch")" \
+                    --argjson bootedBySimLease "$booted_by_simlease" \
                     --argjson expiresAtEpoch "$expires_epoch" \
-                    '{token:$token,udid:$udid,deviceName:$deviceName,owner:$owner,purpose:$purpose,derivedDataPath:$derivedDataPath,expiresAt:$expiresAt,expiresAtEpoch:$expiresAtEpoch}'
+                    '{token:$token,udid:$udid,deviceName:$deviceName,owner:$owner,purpose:$purpose,derivedDataPath:$derivedDataPath,expiresAt:$expiresAt,expiresAtEpoch:$expiresAtEpoch,bootedBySimLease:$bootedBySimLease}'
             else
                 printf 'Simulator lease acquired\n'
                 printf '  Device:       %s\n' "$device_name"
@@ -326,6 +495,7 @@ try_acquire_device() {
                 printf '  Purpose:      %s\n' "${purpose:--}"
                 printf '  Expires:      %s\n' "$(utc_timestamp "$expires_epoch")"
                 printf '  DerivedData:  %s\n' "$derived_data_path"
+                printf '  Started:      %s\n' "$booted_by_simlease"
                 printf '  Token:        %s\n' "$token"
             fi
             return 0
@@ -345,6 +515,38 @@ try_acquire_device() {
     return 1
 }
 
+scale_and_acquire() {
+    local owner="$1"
+    local purpose="$2"
+    local requested_device="$3"
+    local ttl_seconds="$4"
+    local output_json="$5"
+    local allow_active_serve_sim="$6"
+    local capacity
+    local udid
+    local device_name
+
+    # Another task may have released a booted device before this process obtained the pool lock.
+    while IFS=$'\t' read -r udid device_name; do
+        [[ -n "$udid" ]] || continue
+        [[ -z "$requested_device" || "$requested_device" == "$udid" ]] || continue
+        if try_acquire_device "$udid" "$device_name" "$owner" "$purpose" "$ttl_seconds" "$output_json" "$allow_active_serve_sim" false; then
+            return 0
+        fi
+    done < <(booted_devices)
+
+    capacity="$(capacity_json)"
+    [[ "$(jq -r '.canBootAnother' <<< "$capacity")" == "true" ]] || return 1
+    while IFS=$'\t' read -r udid device_name; do
+        [[ -n "$udid" ]] || continue
+        [[ -z "$requested_device" || "$requested_device" == "$udid" ]] || continue
+        if try_acquire_device "$udid" "$device_name" "$owner" "$purpose" "$ttl_seconds" "$output_json" "$allow_active_serve_sim" true; then
+            return 0
+        fi
+    done < <(shutdown_devices)
+    return 1
+}
+
 acquire_lease() {
     local owner=""
     local purpose=""
@@ -353,11 +555,14 @@ acquire_lease() {
     local wait_seconds=0
     local output_json=false
     local allow_active_serve_sim=false
+    local boot_if_needed=false
+    local wait_reason_reported=false
     local started_at
     local device_count
     local candidate_found
     local udid
     local device_name
+    local capacity
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -366,6 +571,7 @@ acquire_lease() {
             --device) [[ $# -ge 2 ]] || fail '--device requires a UUID'; requested_device="$2"; shift 2 ;;
             --ttl) [[ $# -ge 2 ]] || fail '--ttl requires seconds'; ttl_seconds="$2"; shift 2 ;;
             --wait) [[ $# -ge 2 ]] || fail '--wait requires seconds'; wait_seconds="$2"; shift 2 ;;
+            --boot-if-needed) boot_if_needed=true; shift ;;
             --allow-active-serve-sim) allow_active_serve_sim=true; shift ;;
             --json) output_json=true; shift ;;
             -h|--help) usage; exit 0 ;;
@@ -396,8 +602,29 @@ acquire_lease() {
             fi
         done < <(booted_devices)
 
-        [[ "$device_count" -gt 0 ]] || fail 'no available booted simulators were found'
-        [[ "$candidate_found" == "true" ]] || fail "requested simulator '$requested_device' is not booted and available"
+        if [[ "$boot_if_needed" == "true" ]]; then
+            if lockf -t 0 -k "$POOL_LOCK_PATH" "$SCRIPT_PATH" __scale-and-acquire \
+                "$owner" "$purpose" "$requested_device" "$ttl_seconds" "$output_json" "$allow_active_serve_sim"; then
+                return 0
+            fi
+            if [[ "$wait_reason_reported" == "false" ]]; then
+                capacity="$(capacity_json)"
+                case "$(jq -r '.reason' <<< "$capacity")" in
+                    insufficient-free-memory)
+                        printf 'simlease: not enough free memory to boot another Simulator; waiting for a lease\n' >&2 ;;
+                    booted-simulator-limit)
+                        printf 'simlease: the safe booted Simulator limit is reached; waiting for a lease\n' >&2 ;;
+                    memory-pressure-unavailable)
+                        printf 'simlease: memory pressure could not be measured safely; waiting for a lease\n' >&2 ;;
+                esac
+                wait_reason_reported=true
+            fi
+        fi
+
+        if [[ "$boot_if_needed" != "true" ]]; then
+            [[ "$device_count" -gt 0 ]] || fail 'no available booted simulators were found'
+            [[ "$candidate_found" == "true" ]] || fail "requested simulator '$requested_device' is not booted and available"
+        fi
         if [[ $(( $(date +%s) - started_at )) -ge "$wait_seconds" ]]; then
             status_leases >&2 || true
             fail 'all matching simulators are currently leased'
@@ -416,6 +643,7 @@ status_json() {
     local state
     local lease_json
     local entry
+    local capacity
 
     initialize_directories
     devices_file="$(mktemp "${TMPDIR:-/tmp}/simlease-devices.XXXXXX")"
@@ -464,8 +692,9 @@ status_json() {
         mv "${result_file}.next" "$result_file"
     done < "$devices_file"
 
-    jq -n --arg leaseDirectory "$LEASE_ROOT" --slurpfile devices "$result_file" \
-        '{leaseDirectory:$leaseDirectory,devices:$devices[0]}'
+    capacity="$(capacity_json)"
+    jq -n --arg leaseDirectory "$LEASE_ROOT" --slurpfile devices "$result_file" --argjson capacity "$capacity" \
+        '{leaseDirectory:$leaseDirectory,capacity:$capacity,devices:$devices[0]}'
     rm -f "$devices_file" "$result_file"
 }
 
@@ -484,7 +713,8 @@ status_leases() {
 
     status_json | jq -r '
         if (.devices | length) == 0 then
-            "No booted simulators or active leases."
+            "No booted simulators or active leases.\n" +
+            "Capacity: \(.capacity.freeMemoryMB) MB free; can boot another: \(.capacity.canBootAnother) (\(.capacity.reason))"
         else
             (["STATE\tDEVICE\tUUID\tOWNER\tPURPOSE\tEXPIRES"] +
              [.devices[] |
@@ -495,7 +725,8 @@ status_leases() {
                     (.lease.owner // "-"),
                     (.lease.purpose // "-"),
                     (.lease.expiresAt // "-")
-                ] | @tsv]) | .[]
+                ] | @tsv] +
+             ["Capacity: \(.capacity.freeMemoryMB) MB free; \(.capacity.bootedSimulators)/\(.capacity.maxBootedSimulators) booted; can boot another: \(.capacity.canBootAnother) (\(.capacity.reason))"]) | .[]
         end'
 }
 
@@ -559,6 +790,7 @@ release_lease() {
     local udid
     local device_name
     local release_file
+    local booted_by_simlease
     local _attempt
 
     while [[ $# -gt 0 ]]; do
@@ -574,10 +806,11 @@ release_lease() {
     metadata="$(find_metadata_by_token_hash "$hashed_token")" || fail 'lease token is invalid or no longer active'
     udid="$(jq -r '.udid' "$metadata")"
     device_name="$(jq -r '.deviceName' "$metadata")"
+    booted_by_simlease="$(jq -r '.bootedBySimLease // false' "$metadata")"
     release_file="${SIGNAL_DIR}/${hashed_token}.release"
     : > "$release_file"
 
-    for _attempt in $(seq 1 50); do
+    for _attempt in $(seq 1 300); do
         [[ ! -f "$metadata" ]] && break
         sleep 0.1
     done
@@ -587,9 +820,13 @@ release_lease() {
     fi
 
     if [[ "$output_json" == "true" ]]; then
-        jq -n --arg udid "$udid" --arg deviceName "$device_name" '{released:true,udid:$udid,deviceName:$deviceName}'
+        jq -n --arg udid "$udid" --arg deviceName "$device_name" --argjson shutDown "$booted_by_simlease" \
+            '{released:true,udid:$udid,deviceName:$deviceName,shutDown:$shutDown}'
     else
         printf 'Released simulator lease for %s (%s)\n' "$device_name" "$udid"
+        if [[ "$booted_by_simlease" == "true" ]]; then
+            printf 'Shut down Simulator started by SimLease\n'
+        fi
     fi
 }
 
@@ -633,6 +870,7 @@ main() {
         exec) shift; execute_with_lease "$@" ;;
         __guard) shift; initialize_directories; guard_lease "$@" ;;
         __cleanup-stale) shift; initialize_directories; cleanup_stale_metadata_under_lock "$@" ;;
+        __scale-and-acquire) shift; initialize_directories; scale_and_acquire "$@" ;;
         --version|-V) printf 'simlease %s\n' "$SIMLEASE_VERSION" ;;
         -h|--help|help|'') usage ;;
         *) fail "unknown command '$1'" ;;
