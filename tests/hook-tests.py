@@ -68,6 +68,24 @@ def main() -> None:
         assert not invoke(
             "mcp__xcodebuildmcp__build_sim", {"simulatorId": UDID}, workspace / "Sources", lease_root
         )
+        (leases / f"{UDID}.json").write_text(
+            json.dumps(
+                {
+                    "udid": UDID,
+                    "workspace": str(workspace),
+                    "guardPid": os.getpid(),
+                    "guardLabel": "com.simlease.guard.not-running",
+                }
+            )
+        )
+        assert is_denied(
+            invoke(
+                "mcp__xcodebuildmcp__build_sim",
+                {"simulatorId": UDID},
+                workspace / "Sources",
+                lease_root,
+            )
+        )
 
     print("Codex hook tests passed")
 

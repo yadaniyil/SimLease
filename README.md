@@ -63,7 +63,7 @@ The installer runs a dependency preflight and installs to `~/.local/bin/simlease
 - macOS with Xcode command-line tools
 - Bash
 - `jq`
-- `lockf`, `shasum`, and `uuidgen` from macOS
+- `install`, `launchctl`, `lockf`, `shasum`, and `uuidgen` from macOS
 - At least one available iOS Simulator device; SimLease can boot one when memory permits
 
 Check a machine without acquiring a lease:
@@ -112,8 +112,8 @@ simlease exec --token TOKEN -- COMMAND [ARG ...]
 
 1. SimLease discovers booted simulators using `simctl`.
 2. Each simulator UUID has its own `lockf` lock file.
-3. Acquisition starts a guard process that holds the lock for the lease lifetime.
-4. JSON metadata records the owner, purpose, expiry, workspace, and guard PID.
+3. Acquisition submits a one-shot guard to the user's `launchd` domain, outside the acquiring command's process tree.
+4. The guard holds the lock for the lease lifetime, and JSON metadata records its owner, purpose, expiry, workspace, PID, and launchd label.
 5. A second cooperating process cannot acquire the same kernel lock.
 6. When every running Simulator is busy, `--boot-if-needed` checks macOS memory pressure and a RAM-derived pool limit before starting one more device.
 7. Release signals the guard; expiry or stale-lease cleanup makes the simulator available again.
@@ -121,7 +121,7 @@ simlease exec --token TOKEN -- COMMAND [ARG ...]
 
 By default, a new Simulator requires at least 4 GB and 15% free memory. The pool cap is one booted Simulator below 16 GB total RAM, two below 32 GB, and three at 32 GB or more. Advanced users can tune `SIMLEASE_MIN_FREE_MEMORY_MB`, `SIMLEASE_MIN_FREE_MEMORY_PERCENT`, and `SIMLEASE_MAX_BOOTED_SIMULATORS`.
 
-Runtime state defaults to `${TMPDIR}/simlease`. Override it with `SIMLEASE_DIR` when necessary. Every cooperating process must use the same state directory.
+Runtime state defaults to `${TMPDIR}/simlease`. Override it with `SIMLEASE_DIR` when necessary. Every cooperating process must use the same state directory. SimLease also keeps private, versioned guard executables under `${TMPDIR}/simlease-runtime` so `launchd` can run leases acquired from TCC-protected project directories.
 
 ## Automatic Codex protection
 
@@ -133,7 +133,7 @@ Codex requires each user to review and trust a newly installed or changed hook w
 
 SimLease coordinates cooperating clients. Its Codex hook protects normal hooked tool calls, but it cannot police Xcode, Terminal, another agent product, disabled hooks, or specialized tool paths that do not participate in Codex hooks. Those clients must use the standalone CLI policy and the exact leased UUID.
 
-A live `serve-sim` helper without a matching lease is reported as `unmanaged-serve-sim` and blocks acquisition. `--allow-active-serve-sim` is reserved for an explicitly approved migration of that existing session.
+A previously started `serve-sim` helper does not reserve its Simulator. Status reports the helper with `serveSimActive: true`; when the Simulator's kernel lock is free, normal acquisition reuses that already booted device before `--boot-if-needed` considers starting another one. Acquisition returns `serveSimAlreadyRunning: true` so agents know to reuse the inherited helper and leave it running during cleanup.
 
 ## Development and releases
 

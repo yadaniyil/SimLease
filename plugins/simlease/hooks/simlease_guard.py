@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -74,10 +75,27 @@ def has_workspace_lease(udid: str, cwd: str) -> bool:
     metadata = lease_root / "leases" / f"{udid}.json"
     try:
         lease = json.loads(metadata.read_text())
-        guard_pid = int(lease.get("guardPid", 0))
-        os.kill(guard_pid, 0)
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
+    guard_label = lease.get("guardLabel")
+    if isinstance(guard_label, str) and guard_label:
+        try:
+            job = subprocess.run(
+                ["launchctl", "list", guard_label],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except OSError:
+            return False
+        if job.returncode != 0 or not re.search(r'"PID"\s*=\s*\d+;', job.stdout):
+            return False
+    else:
+        try:
+            guard_pid = int(lease.get("guardPid", 0))
+            os.kill(guard_pid, 0)
+        except (OSError, ValueError, TypeError):
+            return False
     workspace = lease.get("workspace")
     return isinstance(workspace, str) and workspace_contains(workspace, cwd)
 

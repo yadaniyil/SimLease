@@ -9,12 +9,13 @@ LEASE_DIR="${LEASE_ROOT}/leases"
 SIGNAL_DIR="${LEASE_ROOT}/signals"
 HANDSHAKE_DIR="${LEASE_ROOT}/handshakes"
 DERIVED_DATA_ROOT="${LEASE_ROOT}/derived-data"
+RUNTIME_ROOT="${SIMLEASE_RUNTIME_DIR:-${TMPDIR:-/tmp}/simlease-runtime}"
 POOL_LOCK_PATH="${LOCK_DIR}/pool.lock"
 SERVE_SIM_STATE_DIR="${SIMLEASE_SERVE_SIM_STATE_DIR:-${TMPDIR:-/tmp}/serve-sim}"
 DEFAULT_TTL_SECONDS="${SIMLEASE_TTL_SECONDS:-3600}"
 MIN_FREE_MEMORY_MB="${SIMLEASE_MIN_FREE_MEMORY_MB:-4096}"
 MIN_FREE_MEMORY_PERCENT="${SIMLEASE_MIN_FREE_MEMORY_PERCENT:-15}"
-SIMLEASE_VERSION="0.2.0"
+SIMLEASE_VERSION="0.2.1"
 
 usage() {
     cat <<'EOF'
@@ -32,8 +33,6 @@ Acquire options:
   --ttl SECONDS      Lease lifetime; defaults to 3600 seconds.
   --wait SECONDS     Wait for a simulator; defaults to 0.
   --boot-if-needed   Boot one additional Simulator when the pool is busy and memory permits.
-  --allow-active-serve-sim
-                     Explicitly adopt a simulator with an unmanaged serve-sim helper.
   --json             Emit machine-readable JSON.
 
 SIMLEASE_DIR overrides the shared state directory.
@@ -65,9 +64,59 @@ require_positive_integer() {
     [[ "$2" -gt 0 ]] || fail "$1 must be greater than zero"
 }
 
+launchd_job_is_loaded() {
+    local label="$1"
+    [[ -n "$label" ]] || return 1
+    launchctl list "$label" >/dev/null 2>&1
+}
+
+launchd_job_is_running() {
+    local label="$1"
+    launchctl list "$label" 2>/dev/null |
+        awk '/"PID"[[:space:]]*=[[:space:]]*[0-9]+;/ { running=1 } END { exit !running }'
+}
+
+remove_launchd_job() {
+    local label="$1"
+    [[ -n "$label" ]] || return 0
+    launchctl remove "$label" >/dev/null 2>&1 || true
+}
+
+metadata_guard_is_alive() {
+    local metadata="$1"
+    local guard_label
+    local guard_pid
+
+    guard_label="$(jq -r '.guardLabel // empty' "$metadata" 2>/dev/null || true)"
+    if [[ -n "$guard_label" ]]; then
+        launchd_job_is_running "$guard_label"
+        return
+    fi
+
+    # Schema v2 leases predate launchd ownership. Keep recognizing them until
+    # they expire or are released so upgrades do not invalidate active work.
+    guard_pid="$(jq -r '.guardPid // 0' "$metadata" 2>/dev/null || printf '0')"
+    [[ "$guard_pid" =~ ^[0-9]+$ ]] && [[ "$guard_pid" -gt 1 ]] && kill -0 "$guard_pid" 2>/dev/null
+}
+
 initialize_directories() {
-    mkdir -p "$LOCK_DIR" "$LEASE_DIR" "$SIGNAL_DIR" "$HANDSHAKE_DIR" "$DERIVED_DATA_ROOT"
-    chmod 700 "$LEASE_ROOT" "$LOCK_DIR" "$LEASE_DIR" "$SIGNAL_DIR" "$HANDSHAKE_DIR" "$DERIVED_DATA_ROOT" 2>/dev/null || true
+    mkdir -p "$LOCK_DIR" "$LEASE_DIR" "$SIGNAL_DIR" "$HANDSHAKE_DIR" "$DERIVED_DATA_ROOT" "$RUNTIME_ROOT"
+    chmod 700 "$LEASE_ROOT" "$LOCK_DIR" "$LEASE_DIR" "$SIGNAL_DIR" "$HANDSHAKE_DIR" "$DERIVED_DATA_ROOT" "$RUNTIME_ROOT" 2>/dev/null || true
+}
+
+install_runtime_script() {
+    local script_digest
+    local runtime_script
+    local temporary
+
+    script_digest="$(shasum -a 256 "$SCRIPT_PATH" | awk '{print substr($1, 1, 16)}')"
+    runtime_script="${RUNTIME_ROOT}/simlease-${SIMLEASE_VERSION}-${script_digest}"
+    if [[ ! -x "$runtime_script" ]]; then
+        temporary="${runtime_script}.tmp.$$"
+        install -m 0700 "$SCRIPT_PATH" "$temporary"
+        mv "$temporary" "$runtime_script"
+    fi
+    printf '%s\n' "$runtime_script"
 }
 
 token_hash() {
@@ -249,13 +298,11 @@ active_serve_sim_state() {
 remove_metadata_if_stale() {
     local udid="$1"
     local metadata
-    local guard_pid
     local stale_token_hash
     metadata="$(metadata_path_for_udid "$udid")"
     [[ -f "$metadata" ]] || return 0
 
-    guard_pid="$(jq -r '.guardPid // 0' "$metadata" 2>/dev/null || printf '0')"
-    if [[ "$guard_pid" =~ ^[0-9]+$ ]] && [[ "$guard_pid" -gt 1 ]] && kill -0 "$guard_pid" 2>/dev/null; then
+    if metadata_guard_is_alive "$metadata"; then
         return 0
     fi
 
@@ -271,22 +318,23 @@ cleanup_stale_metadata_under_lock() {
     local expected_token_hash="$2"
     local metadata
     local current_token_hash
-    local guard_pid
+    local guard_label
     local booted_by_simlease
 
     metadata="$(metadata_path_for_udid "$udid")"
     [[ -f "$metadata" ]] || return 0
     current_token_hash="$(jq -r '.tokenHash // empty' "$metadata" 2>/dev/null || true)"
     [[ "$current_token_hash" == "$expected_token_hash" ]] || return 0
-    guard_pid="$(jq -r '.guardPid // 0' "$metadata" 2>/dev/null || printf '0')"
-    if [[ "$guard_pid" =~ ^[0-9]+$ ]] && [[ "$guard_pid" -gt 1 ]] && kill -0 "$guard_pid" 2>/dev/null; then
+    if metadata_guard_is_alive "$metadata"; then
         return 0
     fi
+    guard_label="$(jq -r '.guardLabel // empty' "$metadata" 2>/dev/null || true)"
     booted_by_simlease="$(jq -r '.bootedBySimLease // false' "$metadata" 2>/dev/null || printf 'false')"
     if [[ "$booted_by_simlease" == "true" ]]; then
         shutdown_device "$udid"
     fi
     rm -f "$metadata"
+    remove_launchd_job "$guard_label"
 }
 
 find_metadata_by_token_hash() {
@@ -317,10 +365,11 @@ write_metadata() {
     local derived_data_path="${12}"
     local booted_by_simlease="${13}"
     local lifecycle_state="${14}"
+    local guard_label="${15}"
     local temporary="${metadata}.tmp.${guard_pid}"
 
     jq -n \
-        --argjson schemaVersion 2 \
+        --argjson schemaVersion 3 \
         --arg udid "$udid" \
         --arg deviceName "$device_name" \
         --arg owner "$owner" \
@@ -335,6 +384,7 @@ write_metadata() {
         --argjson ttlSeconds "$ttl_seconds" \
         --argjson lockPid "$lock_pid" \
         --argjson guardPid "$guard_pid" \
+        --arg guardLabel "$guard_label" \
         --argjson bootedBySimLease "$booted_by_simlease" \
         --arg lifecycleState "$lifecycle_state" \
         '{
@@ -352,6 +402,7 @@ write_metadata() {
             ttlSeconds: $ttlSeconds,
             lockPid: $lockPid,
             guardPid: $guardPid,
+            guardLabel: $guardLabel,
             bootedBySimLease: $bootedBySimLease,
             lifecycleState: $lifecycleState,
             derivedDataPath: $derivedDataPath
@@ -390,6 +441,7 @@ guard_lease() {
     local ttl_seconds="$8"
     local derived_data_path="$9"
     local booted_by_simlease="${10}"
+    local guard_label="${11}"
     local metadata
     local ready_file="${HANDSHAKE_DIR}/${hashed_token}.ready"
     local acknowledged_file="${HANDSHAKE_DIR}/${hashed_token}.ack"
@@ -409,7 +461,8 @@ guard_lease() {
     write_metadata \
         "$metadata" "$udid" "$device_name" "$owner" "$purpose" "$hashed_token" \
         "$acquired_epoch" "$expires_epoch" "$ttl_seconds" "$PPID" "$$" "$derived_data_path" \
-        "$booted_by_simlease" "$([[ "$booted_by_simlease" == "true" ]] && printf 'booting' || printf 'leased')"
+        "$booted_by_simlease" "$([[ "$booted_by_simlease" == "true" ]] && printf 'booting' || printf 'leased')" \
+        "$guard_label"
 
     if [[ "$booted_by_simlease" == "true" ]]; then
         boot_device "$udid" || exit 1
@@ -433,6 +486,24 @@ guard_lease() {
     done
 }
 
+launchd_guard_entry() {
+    local guard_label="$1"
+    local udid="$2"
+    local exit_status
+    shift 2
+
+    set +e
+    lockf -t 0 -k "$(lock_path_for_udid "$udid")" \
+        "$SCRIPT_PATH" __guard "$udid" "$@" "$guard_label"
+    exit_status=$?
+    set -e
+
+    # `launchctl submit` creates a keep-alive job. Removing it here makes the
+    # job one-shot while still allowing launchd to own it across tool calls.
+    remove_launchd_job "$guard_label"
+    return "$exit_status"
+}
+
 try_acquire_device() {
     local udid="$1"
     local device_name="$2"
@@ -440,8 +511,8 @@ try_acquire_device() {
     local purpose="$4"
     local ttl_seconds="$5"
     local output_json="$6"
-    local allow_active_serve_sim="$7"
-    local booted_by_simlease="${8:-false}"
+    local booted_by_simlease="${7:-false}"
+    local serve_sim_already_running=false
     local token
     local hashed_token
     local acquired_epoch
@@ -449,12 +520,14 @@ try_acquire_device() {
     local derived_data_path
     local ready_file
     local acknowledged_file
-    local launcher_pid
+    local guard_label
+    local -a guard_environment
+    local runtime_script
     local _attempt
 
     remove_metadata_if_stale "$udid"
-    if [[ "$allow_active_serve_sim" != "true" ]] && active_serve_sim_state "$udid" >/dev/null; then
-        return 1
+    if active_serve_sim_state "$udid" >/dev/null; then
+        serve_sim_already_running=true
     fi
     token="$(uuidgen | tr '[:upper:]' '[:lower:]')"
     hashed_token="$(token_hash "$token")"
@@ -463,14 +536,27 @@ try_acquire_device() {
     derived_data_path="${DERIVED_DATA_ROOT}/$(workspace_key)/${udid}"
     ready_file="${HANDSHAKE_DIR}/${hashed_token}.ready"
     acknowledged_file="${HANDSHAKE_DIR}/${hashed_token}.ack"
+    guard_label="com.simlease.guard.${hashed_token:0:32}"
+    runtime_script="$(install_runtime_script)"
     rm -f "$ready_file" "$acknowledged_file" "${SIGNAL_DIR}/${hashed_token}.release"
 
-    lockf -t 0 -k "$(lock_path_for_udid "$udid")" \
-        "$SCRIPT_PATH" __guard \
+    guard_environment=(
+        "PATH=${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+        "SIMLEASE_DIR=${LEASE_ROOT}"
+        "SIMLEASE_WORKSPACE=${PROJECT_ROOT}"
+        "SIMLEASE_RUNTIME_DIR=${RUNTIME_ROOT}"
+    )
+    if [[ -n "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]]; then
+        guard_environment+=("SIMLEASE_TEST_DEVICE_STATE_DIR=${SIMLEASE_TEST_DEVICE_STATE_DIR}")
+    fi
+
+    if ! launchctl submit -l "$guard_label" -o /dev/null -e /dev/null -- \
+        /usr/bin/env "${guard_environment[@]}" \
+        "$runtime_script" __launchd-guard "$guard_label" \
         "$udid" "$device_name" "$owner" "$purpose" "$hashed_token" \
-        "$acquired_epoch" "$expires_epoch" "$ttl_seconds" "$derived_data_path" "$booted_by_simlease" \
-        >/dev/null 2>&1 &
-    launcher_pid=$!
+        "$acquired_epoch" "$expires_epoch" "$ttl_seconds" "$derived_data_path" "$booted_by_simlease"; then
+        return 1
+    fi
 
     for _attempt in $(seq 1 "${SIMLEASE_ACQUIRE_HANDSHAKE_ATTEMPTS:-1800}"); do
         if [[ -f "$ready_file" ]]; then
@@ -485,8 +571,9 @@ try_acquire_device() {
                     --arg derivedDataPath "$derived_data_path" \
                     --arg expiresAt "$(utc_timestamp "$expires_epoch")" \
                     --argjson bootedBySimLease "$booted_by_simlease" \
+                    --argjson serveSimAlreadyRunning "$serve_sim_already_running" \
                     --argjson expiresAtEpoch "$expires_epoch" \
-                    '{token:$token,udid:$udid,deviceName:$deviceName,owner:$owner,purpose:$purpose,derivedDataPath:$derivedDataPath,expiresAt:$expiresAt,expiresAtEpoch:$expiresAtEpoch,bootedBySimLease:$bootedBySimLease}'
+                    '{token:$token,udid:$udid,deviceName:$deviceName,owner:$owner,purpose:$purpose,derivedDataPath:$derivedDataPath,expiresAt:$expiresAt,expiresAtEpoch:$expiresAtEpoch,bootedBySimLease:$bootedBySimLease,serveSimAlreadyRunning:$serveSimAlreadyRunning}'
             else
                 printf 'Simulator lease acquired\n'
                 printf '  Device:       %s\n' "$device_name"
@@ -496,21 +583,25 @@ try_acquire_device() {
                 printf '  Expires:      %s\n' "$(utc_timestamp "$expires_epoch")"
                 printf '  DerivedData:  %s\n' "$derived_data_path"
                 printf '  Started:      %s\n' "$booted_by_simlease"
+                printf '  serve-sim:    %s\n' "$serve_sim_already_running"
                 printf '  Token:        %s\n' "$token"
             fi
             return 0
         fi
 
-        if ! kill -0 "$launcher_pid" 2>/dev/null; then
-            wait "$launcher_pid" 2>/dev/null || true
+        if ! launchd_job_is_loaded "$guard_label"; then
+            rm -f "$ready_file" "$acknowledged_file"
+            return 1
+        fi
+        if [[ "$_attempt" -gt 100 ]] && ! launchd_job_is_running "$guard_label"; then
+            remove_launchd_job "$guard_label"
             rm -f "$ready_file" "$acknowledged_file"
             return 1
         fi
         sleep 0.05
     done
 
-    kill "$launcher_pid" 2>/dev/null || true
-    wait "$launcher_pid" 2>/dev/null || true
+    remove_launchd_job "$guard_label"
     rm -f "$ready_file" "$acknowledged_file"
     return 1
 }
@@ -521,7 +612,6 @@ scale_and_acquire() {
     local requested_device="$3"
     local ttl_seconds="$4"
     local output_json="$5"
-    local allow_active_serve_sim="$6"
     local capacity
     local udid
     local device_name
@@ -530,7 +620,7 @@ scale_and_acquire() {
     while IFS=$'\t' read -r udid device_name; do
         [[ -n "$udid" ]] || continue
         [[ -z "$requested_device" || "$requested_device" == "$udid" ]] || continue
-        if try_acquire_device "$udid" "$device_name" "$owner" "$purpose" "$ttl_seconds" "$output_json" "$allow_active_serve_sim" false; then
+        if try_acquire_device "$udid" "$device_name" "$owner" "$purpose" "$ttl_seconds" "$output_json" false; then
             return 0
         fi
     done < <(booted_devices)
@@ -540,7 +630,7 @@ scale_and_acquire() {
     while IFS=$'\t' read -r udid device_name; do
         [[ -n "$udid" ]] || continue
         [[ -z "$requested_device" || "$requested_device" == "$udid" ]] || continue
-        if try_acquire_device "$udid" "$device_name" "$owner" "$purpose" "$ttl_seconds" "$output_json" "$allow_active_serve_sim" true; then
+        if try_acquire_device "$udid" "$device_name" "$owner" "$purpose" "$ttl_seconds" "$output_json" true; then
             return 0
         fi
     done < <(shutdown_devices)
@@ -554,7 +644,6 @@ acquire_lease() {
     local ttl_seconds="$DEFAULT_TTL_SECONDS"
     local wait_seconds=0
     local output_json=false
-    local allow_active_serve_sim=false
     local boot_if_needed=false
     local wait_reason_reported=false
     local started_at
@@ -572,7 +661,9 @@ acquire_lease() {
             --ttl) [[ $# -ge 2 ]] || fail '--ttl requires seconds'; ttl_seconds="$2"; shift 2 ;;
             --wait) [[ $# -ge 2 ]] || fail '--wait requires seconds'; wait_seconds="$2"; shift 2 ;;
             --boot-if-needed) boot_if_needed=true; shift ;;
-            --allow-active-serve-sim) allow_active_serve_sim=true; shift ;;
+            # Compatibility with v0.2.0. Active serve-sim helpers no longer
+            # block acquisition, so this former opt-in flag is now a no-op.
+            --allow-active-serve-sim) shift ;;
             --json) output_json=true; shift ;;
             -h|--help) usage; exit 0 ;;
             *) fail "unknown acquire option '$1'" ;;
@@ -597,14 +688,14 @@ acquire_lease() {
                 continue
             fi
             candidate_found=true
-            if try_acquire_device "$udid" "$device_name" "$owner" "$purpose" "$ttl_seconds" "$output_json" "$allow_active_serve_sim"; then
+            if try_acquire_device "$udid" "$device_name" "$owner" "$purpose" "$ttl_seconds" "$output_json"; then
                 return 0
             fi
         done < <(booted_devices)
 
         if [[ "$boot_if_needed" == "true" ]]; then
             if lockf -t 0 -k "$POOL_LOCK_PATH" "$SCRIPT_PATH" __scale-and-acquire \
-                "$owner" "$purpose" "$requested_device" "$ttl_seconds" "$output_json" "$allow_active_serve_sim"; then
+                "$owner" "$purpose" "$requested_device" "$ttl_seconds" "$output_json"; then
                 return 0
             fi
             if [[ "$wait_reason_reported" == "false" ]]; then
@@ -642,6 +733,7 @@ status_json() {
     local booted
     local state
     local lease_json
+    local serve_sim_active
     local entry
     local capacity
 
@@ -668,12 +760,13 @@ status_json() {
         [[ -n "$udid" ]] || continue
         metadata="$(metadata_path_for_udid "$udid")"
         remove_metadata_if_stale "$udid"
+        serve_sim_active=false
+        if active_serve_sim_state "$udid" >/dev/null; then
+            serve_sim_active=true
+        fi
         if [[ -f "$metadata" ]]; then
             state='leased'
             lease_json="$(jq 'del(.tokenHash)' "$metadata")"
-        elif active_serve_sim_state "$udid" >/dev/null; then
-            state='unmanaged-serve-sim'
-            lease_json='null'
         elif probe_lock_is_free "$udid"; then
             state='free'
             lease_json='null'
@@ -687,7 +780,8 @@ status_json() {
             --arg state "$state" \
             --argjson booted "$booted" \
             --argjson lease "$lease_json" \
-            '{udid:$udid,deviceName:$deviceName,booted:$booted,state:$state,lease:$lease}')"
+            --argjson serveSimActive "$serve_sim_active" \
+            '{udid:$udid,deviceName:$deviceName,booted:$booted,state:$state,lease:$lease,serveSimActive:$serveSimActive}')"
         jq --argjson entry "$entry" '. + [$entry]' "$result_file" > "${result_file}.next"
         mv "${result_file}.next" "$result_file"
     done < "$devices_file"
@@ -716,12 +810,13 @@ status_leases() {
             "No booted simulators or active leases.\n" +
             "Capacity: \(.capacity.freeMemoryMB) MB free; can boot another: \(.capacity.canBootAnother) (\(.capacity.reason))"
         else
-            (["STATE\tDEVICE\tUUID\tOWNER\tPURPOSE\tEXPIRES"] +
+            (["STATE\tDEVICE\tUUID\tSERVE-SIM\tOWNER\tPURPOSE\tEXPIRES"] +
              [.devices[] |
                 [
                     .state,
                     .deviceName,
                     .udid,
+                    (if .serveSimActive then "running" else "-" end),
                     (.lease.owner // "-"),
                     (.lease.purpose // "-"),
                     (.lease.expiresAt // "-")
@@ -734,14 +829,12 @@ renew_by_hash() {
     local hashed_token="$1"
     local ttl_override="${2:-}"
     local metadata
-    local guard_pid
     local ttl_seconds
     local expires_epoch
     local temporary
 
     metadata="$(find_metadata_by_token_hash "$hashed_token")" || return 1
-    guard_pid="$(jq -r '.guardPid // 0' "$metadata")"
-    [[ "$guard_pid" =~ ^[0-9]+$ ]] && [[ "$guard_pid" -gt 1 ]] && kill -0 "$guard_pid" 2>/dev/null || return 1
+    metadata_guard_is_alive "$metadata" || return 1
     ttl_seconds="${ttl_override:-$(jq -r '.ttlSeconds // 3600' "$metadata")}"
     require_positive_integer '--ttl' "$ttl_seconds"
     expires_epoch=$(( $(date +%s) + ttl_seconds ))
@@ -857,7 +950,9 @@ execute_with_lease() {
 }
 
 main() {
+    require_command install
     require_command jq
+    require_command launchctl
     require_command lockf
     require_command shasum
     require_command uuidgen
@@ -869,6 +964,7 @@ main() {
         release) shift; release_lease "$@" ;;
         exec) shift; execute_with_lease "$@" ;;
         __guard) shift; initialize_directories; guard_lease "$@" ;;
+        __launchd-guard) shift; initialize_directories; launchd_guard_entry "$@" ;;
         __cleanup-stale) shift; initialize_directories; cleanup_stale_metadata_under_lock "$@" ;;
         __scale-and-acquire) shift; initialize_directories; scale_and_acquire "$@" ;;
         --version|-V) printf 'simlease %s\n' "$SIMLEASE_VERSION" ;;
