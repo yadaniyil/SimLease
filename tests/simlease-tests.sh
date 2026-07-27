@@ -13,6 +13,47 @@ TOKEN_A=""
 TOKEN_B=""
 TOKEN_C=""
 
+BOUNDARY_ROOT="${TEST_ROOT}/process-boundary"
+BOUNDARY_DEVICE=$'66666666-6666-6666-6666-666666666666\tiPhone Tool Boundary'
+BOUNDARY_JSON="${BOUNDARY_ROOT}/lease.json"
+mkdir -p "$BOUNDARY_ROOT"
+python3 - "$LEASE_TOOL" "$BOUNDARY_ROOT" "$BOUNDARY_DEVICE" "$BOUNDARY_JSON" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+lease_tool, lease_root, devices, output_path = sys.argv[1:]
+environment = os.environ | {"SIMLEASE_DIR": lease_root, "SIMLEASE_DEVICES": devices}
+acquire = subprocess.Popen(
+    [lease_tool, "acquire", "--owner", "tool-boundary", "--ttl", "60", "--json"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    env=environment,
+    start_new_session=True,
+)
+try:
+    stdout, stderr = acquire.communicate(timeout=15)
+except subprocess.TimeoutExpired:
+    os.killpg(acquire.pid, signal.SIGKILL)
+    acquire.wait()
+    raise
+if acquire.returncode != 0:
+    raise SystemExit(f"boundary acquire failed: {stderr}")
+Path(output_path).write_text(stdout)
+try:
+    os.killpg(acquire.pid, signal.SIGTERM)
+except ProcessLookupError:
+    pass
+PY
+BOUNDARY_TOKEN="$(jq -r '.token' "$BOUNDARY_JSON")"
+SIMLEASE_DIR="$BOUNDARY_ROOT" SIMLEASE_DEVICES="$BOUNDARY_DEVICE" \
+    "$LEASE_TOOL" exec --token "$BOUNDARY_TOKEN" -- true
+SIMLEASE_DIR="$BOUNDARY_ROOT" SIMLEASE_DEVICES="$BOUNDARY_DEVICE" \
+    "$LEASE_TOOL" release --token "$BOUNDARY_TOKEN" >/dev/null
+
 SCALING_ROOT="${TEST_ROOT}/scaling"
 SCALING_STATE="${SCALING_ROOT}/device-state"
 SCALING_DEVICES=$'44444444-4444-4444-4444-444444444444\tiPhone Already Running'
@@ -168,11 +209,17 @@ jq -n \
     --arg device "$UDID_A" \
     '{pid:$pid,device:$device,url:"http://127.0.0.1:3999"}' \
     > "${SIMLEASE_SERVE_SIM_STATE_DIR}/server-${UDID_A}.json"
-if "$LEASE_TOOL" acquire --owner unmanaged-check --device "$UDID_A" --ttl 30 --json >/dev/null 2>&1; then
-    printf 'Agent unexpectedly acquired a simulator with unmanaged serve-sim activity\n' >&2
-    exit 1
-fi
-LEASE_C="$("$LEASE_TOOL" acquire --owner migration-adopter --device "$UDID_A" --allow-active-serve-sim --ttl 30 --json)"
+SERVE_SIM_STATUS="$("$LEASE_TOOL" status --json)"
+[[ "$(jq -r --arg udid "$UDID_A" '.devices[] | select(.udid == $udid) | .state' <<<"$SERVE_SIM_STATUS")" == 'free' ]]
+[[ "$(jq -r --arg udid "$UDID_A" '.devices[] | select(.udid == $udid) | .serveSimActive' <<<"$SERVE_SIM_STATUS")" == 'true' ]]
+LEASE_C="$("$LEASE_TOOL" acquire --owner existing-helper-reuser --device "$UDID_A" --boot-if-needed --ttl 30 --json)"
+TOKEN_C="$(jq -r '.token' <<<"$LEASE_C")"
+[[ "$(jq -r '.bootedBySimLease' <<<"$LEASE_C")" == 'false' ]]
+[[ "$(jq -r '.serveSimAlreadyRunning' <<<"$LEASE_C")" == 'true' ]]
+"$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null
+TOKEN_C=""
+# The v0.2.0 migration flag remains accepted for script compatibility.
+LEASE_C="$("$LEASE_TOOL" acquire --owner compatibility-check --device "$UDID_A" --allow-active-serve-sim --ttl 30 --json)"
 TOKEN_C="$(jq -r '.token' <<<"$LEASE_C")"
 "$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null
 TOKEN_C=""

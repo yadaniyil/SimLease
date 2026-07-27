@@ -14,6 +14,7 @@ Before the first simulator operation in a task, run `scripts/preflight`. If it f
 ## Lease workflow
 
 1. Inspect ownership with `scripts/simlease status --json` when existing simulator activity is possible.
+   A device with `state: "free"` remains available when `serveSimActive` is true. An existing `serve-sim` helper is reusable infrastructure, not a lease or ownership claim.
 2. Acquire before touching a simulator:
 
    ```bash
@@ -48,13 +49,13 @@ After acquisition, tell the user which named Simulator is reserved. If `bootedBy
 ## Tool-specific rules
 
 - For XcodeBuildMCP, set `simulatorId` to the leased UDID before every simulator tool call. Use the returned `derivedDataPath` for builds when the tool supports it.
-- For `serve-sim`, start and stop only the leased UDID. Never stop another task's server.
+- For `serve-sim`, use only the leased UDID. Reuse an existing helper when `serveSimAlreadyRunning` is true and leave that inherited helper running during cleanup. Otherwise start one for that UDID and stop only the helper started by the current task. Never stop a helper while another lease owns its simulator.
 - For direct `xcrun simctl`, pass the exact leased UDID.
 - Do not run simulator-global destructive commands while another lease may exist.
 - If all matching simulators are leased, wait or continue non-simulator work. Never take over another lease.
 - With `--boot-if-needed`, SimLease measures memory pressure and the safe booted-device cap. It starts one shutdown Simulator only when both checks pass. Otherwise, explain that it is waiting for an existing lease.
 - SimLease shuts down only a Simulator that it started for the current lease. Never manually shut down a Simulator that was already running.
-- If status reports `unmanaged-serve-sim`, do not adopt it unless the user explicitly confirms a controlled migration; only then use `--allow-active-serve-sim`.
+- A previously started Simulator or `serve-sim` helper is eligible for normal acquisition. Prefer leasing an already booted free device before allowing `--boot-if-needed` to start another one.
 
 ## Failure handling
 

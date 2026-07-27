@@ -32,8 +32,9 @@ Rules:
 - For XcodeBuildMCP, set `simulatorId` to the leased UUID before any simulator tool call.
 - Do not run simulator-global destructive commands while other agents may be working.
 - Stop serve-sim only for the leased simulator UUID.
+- Leave a `serve-sim` helper running when it existed before the current lease.
 - Always release at the end, including after failures.
 - Release shuts down a Simulator only when SimLease started it for that lease. A previously running device stays running.
 - Inspect current ownership with `simlease status`.
 
-A live serve-sim helper without a matching lease is reported as `unmanaged-serve-sim` and blocks acquisition. `--allow-active-serve-sim` is intended only for an explicit, controlled migration of that existing session.
+A live `serve-sim` helper is reusable infrastructure, not an ownership claim. Status reports it with `serveSimActive: true`; if the simulator's kernel lock is free, normal acquisition leases that already booted device before `--boot-if-needed` considers starting another one.
