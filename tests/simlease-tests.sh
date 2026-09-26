@@ -244,4 +244,38 @@ STALE_STATUS="$("$LEASE_TOOL" status --json)"
 [[ "$(jq -r --arg udid "$UDID_A" '.devices[] | select(.udid == $udid) | .state' <<<"$STALE_STATUS")" == 'free' ]] || fail 'killing the lease guard did not free the Simulator'
 TOKEN_C=""
 
+leases_owned_by() {
+    "$LEASE_TOOL" status --json | jq -r --arg owner "$1" '[.devices[] | select(.lease.owner == $owner)] | length'
+}
+
+# --token-file saves the token privately and never overwrites a live lease's token.
+TOKEN_FILE="${TEST_ROOT}/lease.token"
+"$LEASE_TOOL" acquire --owner file-holder --ttl 3 --token-file "$TOKEN_FILE" >/dev/null
+TOKEN_C="$(cat "$TOKEN_FILE")"
+[[ -n "$TOKEN_C" ]] || fail '--token-file did not save the token'
+[[ "$(stat -f '%Lp' "$TOKEN_FILE")" == '600' ]] || fail 'the token file is readable by others'
+if "$LEASE_TOOL" acquire --owner file-clobber --ttl 3 --token-file "$TOKEN_FILE" >/dev/null 2>&1; then
+    fail 'acquire overwrote a token file that still holds an active lease'
+fi
+[[ "$(cat "$TOKEN_FILE")" == "$TOKEN_C" ]] || fail 'the refused acquire changed the token file'
+
+# exec renews while its command runs, so a 3 s lease outlives a 7 s command.
+"$LEASE_TOOL" exec --token-file "$TOKEN_FILE" -- sleep 7 &
+EXEC_PID=$!
+sleep 6
+[[ "$(leases_owned_by file-holder)" == '1' ]] || fail 'exec let the lease expire under a command longer than its TTL'
+wait "$EXEC_PID" || fail 'exec of the long command failed'
+"$LEASE_TOOL" release --token-file "$TOKEN_FILE" >/dev/null || fail 'release --token-file failed'
+TOKEN_C=""
+[[ "$(leases_owned_by file-holder)" == '0' ]] || fail 'release --token-file left the lease in place'
+
+# Once the command has exited nothing renews, and the lease runs out on time.
+# The file now holds a dead token, which acquire may overwrite.
+"$LEASE_TOOL" acquire --owner short-exec --ttl 3 --token-file "$TOKEN_FILE" >/dev/null || fail 'acquire refused a token file holding a dead token'
+TOKEN_C="$(cat "$TOKEN_FILE")"
+"$LEASE_TOOL" exec --token-file "$TOKEN_FILE" -- true
+sleep 5
+[[ "$(leases_owned_by short-exec)" == '0' ]] || fail 'the lease kept renewing after the exec command exited'
+TOKEN_C=""
+
 printf 'simulator lease tests passed\n'

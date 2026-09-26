@@ -99,14 +99,17 @@ Available commands:
 
 ```text
 simlease acquire --owner NAME [--purpose TEXT] [--device UUID]
-                 [--ttl SECONDS] [--wait SECONDS] [--boot-if-needed] [--json]
+                 [--ttl SECONDS] [--wait SECONDS] [--boot-if-needed]
+                 [--token-file PATH] [--json]
 simlease status [--json]
 simlease renew --token TOKEN [--ttl SECONDS] [--json]
 simlease release --token TOKEN [--json]
 simlease exec --token TOKEN -- COMMAND [ARG ...]
 ```
 
-`simlease exec` validates and renews the lease, then exports `SIMULATOR_UDID`, `SIMULATOR_NAME`, `DERIVED_DATA_PATH`, and `SIMLEASE_TOKEN`.
+`simlease exec` validates and renews the lease, then exports `SIMULATOR_UDID`, `SIMULATOR_NAME`, `DERIVED_DATA_PATH`, and `SIMLEASE_TOKEN`. It keeps renewing the lease at a third of its TTL for as long as the command runs, so a long `flutter run` or test run does not lose its Simulator when the TTL passes. Renewal stops when the command exits.
+
+`acquire --token-file PATH` also writes the token to a private file, and `renew`, `release` and `exec` accept `--token-file PATH` in place of `--token`. Acquire refuses a file that still holds an active lease's token, so a second acquire cannot overwrite the only copy and leak the first lease.
 
 ## How coordination works
 

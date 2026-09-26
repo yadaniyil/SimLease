@@ -41,7 +41,7 @@ Before the first simulator operation in a task, run `scripts/preflight`. If it f
        test
    ```
 
-6. Renew before a long operation with `scripts/simlease renew --token '<token>' --ttl 3600`.
+6. `exec` renews the lease for as long as its command runs. Renew by hand only for work outside `exec`: `scripts/simlease renew --token '<token>' --ttl 3600`. Pass `--token-file <path>` to acquire, renew, release and exec to keep the token out of truncated command output.
 7. Release in cleanup, including after failures: `scripts/simlease release --token '<token>'`.
 
 After acquisition, tell the user which named Simulator is reserved. If `bootedBySimLease` is true, also say `🚀 Started <device> because every running Simulator was busy.` After cleanup, confirm that it was released; if release reports `shutDown: true`, say `💤 Shut down <device> to release its RAM.` Do not expose the lease token in commentary or the final response.
