@@ -7,6 +7,8 @@ TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/simlease-tests.XXXXXX")"
 export SIMLEASE_DIR="${TEST_ROOT}/leases"
 export SIMLEASE_DEVICES=$'11111111-1111-1111-1111-111111111111\tiPhone Test One\n22222222-2222-2222-2222-222222222222\tiPhone Test Two'
 export SIMLEASE_SERVE_SIM_STATE_DIR="${TEST_ROOT}/serve-sim"
+# Keeps the Mac's real simslim profile and pinned list out of the tests.
+export SIMLEASE_CONFIG_DIR="${TEST_ROOT}/config"
 mkdir -p "$SIMLEASE_SERVE_SIM_STATE_DIR"
 
 # macOS /bin/bash 3.2 ignores `set -e` when `[[ ... ]]` fails, so every
@@ -277,5 +279,109 @@ TOKEN_C="$(cat "$TOKEN_FILE")"
 sleep 5
 [[ "$(leases_owned_by short-exec)" == '0' ]] || fail 'the lease kept renewing after the exec command exited'
 TOKEN_C=""
+
+# Every leased Simulator is slimmed with the shared profile plus the lease's
+# --keep-services. The fake simslim remembers the last `on` per device.
+FAKE_SIMSLIM="${TEST_ROOT}/fake-simslim"
+export FAKE_SIMSLIM_STATE="${TEST_ROOT}/fake-simslim-state"
+cat > "$FAKE_SIMSLIM" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p "$FAKE_SIMSLIM_STATE"
+command="$1"; udid="$2"; shift 2
+printf '%s %s %s\n' "$command" "$udid" "$*" >> "${FAKE_SIMSLIM_STATE}/calls.log"
+case "$command" in
+    verify) [[ "$(cat "${FAKE_SIMSLIM_STATE}/${udid}" 2>/dev/null)" == "$*" ]] ;;
+    on) printf '%s' "$*" > "${FAKE_SIMSLIM_STATE}/${udid}" ;;
+esac
+EOF
+chmod +x "$FAKE_SIMSLIM"
+slim_acquire() {
+    SIMLEASE_SIMSLIM_BIN="$FAKE_SIMSLIM" "$LEASE_TOOL" acquire --device "$UDID_A" --ttl 30 --json "$@" 2>/dev/null
+}
+SLIM_LEASE="$(slim_acquire --owner slim-a --keep-services widgets)"
+TOKEN_C="$(jq -r '.token' <<<"$SLIM_LEASE")"
+[[ "$(jq -r '.slim' <<<"$SLIM_LEASE")" == 'applied' ]] || fail 'a stock Simulator was not slimmed on acquire'
+[[ "$(jq -r '.keptServices' <<<"$SLIM_LEASE")" == 'photos,store,icloud,web,widgets' ]] || fail 'kept services are not the profile plus --keep-services'
+"$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null
+SLIM_LEASE="$(slim_acquire --owner slim-b --keep-services widgets)"
+TOKEN_C="$(jq -r '.token' <<<"$SLIM_LEASE")"
+[[ "$(jq -r '.slim' <<<"$SLIM_LEASE")" == 'verified' ]] || fail 'an already slim Simulator was slimmed again'
+"$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null
+mkdir -p "$SIMLEASE_CONFIG_DIR"
+printf '{"name":"shared","except":["photos","store"],"keep":["com.apple.apsd"]}\n' > "${SIMLEASE_CONFIG_DIR}/simslim-profile.json"
+SLIM_LEASE="$(slim_acquire --owner slim-c)"
+TOKEN_C="$(jq -r '.token' <<<"$SLIM_LEASE")"
+[[ "$(jq -r '.slim' <<<"$SLIM_LEASE")" == 'applied' ]] || fail 'a changed profile did not re-slim the Simulator'
+[[ "$(jq -r '.keptServices' <<<"$SLIM_LEASE")" == 'photos,store' ]] || fail 'the shared profile file was not used'
+grep -q -- '--keep com.apple.apsd' "${FAKE_SIMSLIM_STATE}/calls.log" || fail 'the profile keep list was not passed to simslim'
+"$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null
+rm -f "${SIMLEASE_CONFIG_DIR}/simslim-profile.json"
+SLIM_LEASE="$(SIMLEASE_SLIM=0 slim_acquire --owner slim-off)"
+TOKEN_C="$(jq -r '.token' <<<"$SLIM_LEASE")"
+[[ "$(jq -r '.slim' <<<"$SLIM_LEASE")" == 'off' ]] || fail 'SIMLEASE_SLIM=0 did not turn slimming off'
+"$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null
+TOKEN_C=""
+
+# Pinned Simulators are skipped by automatic picks and leased only by --device.
+printf '%s   # signed in, keep\n' "$UDID_A" > "${SIMLEASE_CONFIG_DIR}/pinned"
+PIN_AUTO="$("$LEASE_TOOL" acquire --owner pin-auto --ttl 30 --json)"
+TOKEN_C="$(jq -r '.token' <<<"$PIN_AUTO")"
+[[ "$(jq -r '.udid' <<<"$PIN_AUTO")" != "$UDID_A" ]] || fail 'an automatic pick leased a pinned Simulator'
+if "$LEASE_TOOL" acquire --owner pin-auto-2 --ttl 30 --json >/dev/null 2>&1; then
+    fail 'an automatic pick leased the pinned Simulator when nothing else was free'
+fi
+PIN_DIRECT="$("$LEASE_TOOL" acquire --owner pin-direct --device "$UDID_A" --ttl 30 --json)"
+TOKEN_B="$(jq -r '.token' <<<"$PIN_DIRECT")"
+[[ "$(jq -r '.udid' <<<"$PIN_DIRECT")" == "$UDID_A" ]] || fail '--device did not lease the pinned Simulator'
+"$LEASE_TOOL" release --token "$TOKEN_B" >/dev/null
+TOKEN_B=""
+"$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null
+TOKEN_C=""
+rm -f "${SIMLEASE_CONFIG_DIR}/pinned"
+
+# Android: every lease boots its own emulator instance on a free port.
+export SIMLEASE_ANDROID_TEST_STATE_DIR="${TEST_ROOT}/android"
+export SIMLEASE_ANDROID_AVDS=$'avd_shared\navd_signed_in'
+export SIMLEASE_MAX_EMULATORS=2
+AND_A="$("$LEASE_TOOL" acquire --avd avd_shared --owner and-a --ttl 30 --json)"
+TOKEN_A="$(jq -r '.token' <<<"$AND_A")"
+[[ "$(jq -r '.platform' <<<"$AND_A")" == 'android' ]] || fail 'emulator lease does not say platform android'
+[[ "$(jq -r '.serial' <<<"$AND_A")" == 'emulator-5560' ]] || fail 'first emulator did not get port 5560'
+[[ "$(jq -r '.grpcPort' <<<"$AND_A")" == '8560' ]] || fail 'emulator gRPC port is not port+3000'
+[[ "$(jq -r '.writable' <<<"$AND_A")" == 'false' ]] || fail 'emulator was not read-only by default'
+[[ -f "${SIMLEASE_ANDROID_TEST_STATE_DIR}/emulator-5560.running" ]] || fail 'emulator was not booted'
+AND_B="$("$LEASE_TOOL" acquire --android --avd avd_shared --owner and-b --ttl 30 --json)"
+TOKEN_B="$(jq -r '.token' <<<"$AND_B")"
+[[ "$(jq -r '.serial' <<<"$AND_B")" == 'emulator-5562' ]] || fail 'two read-only leases could not share one AVD'
+if "$LEASE_TOOL" acquire --avd avd_signed_in --owner and-over --ttl 30 --json >/dev/null 2>&1; then
+    fail 'an emulator lease went past SIMLEASE_MAX_EMULATORS'
+fi
+# shellcheck disable=SC2016 # Expanded by the leased child shell.
+AND_ENV="$("$LEASE_TOOL" exec --token "$TOKEN_A" -- sh -c 'printf "%s|%s|%s|%s" "$ANDROID_SERIAL" "$ANDROID_AVD_NAME" "$ANDROID_EMULATOR_GRPC_PORT" "${SIMULATOR_UDID:-none}"')"
+[[ "$AND_ENV" == 'emulator-5560|avd_shared|8560|none' ]] || fail "exec exported the wrong emulator environment: ${AND_ENV}"
+[[ "$("$LEASE_TOOL" status --json | jq '[.devices[] | select(.udid | startswith("emulator-")) | select(.state == "leased")] | length')" == '2' ]] \
+    || fail 'status does not list both emulator leases'
+"$LEASE_TOOL" release --token "$TOKEN_B" >/dev/null
+TOKEN_B=""
+[[ ! -f "${SIMLEASE_ANDROID_TEST_STATE_DIR}/emulator-5562.running" ]] || fail 'release did not stop the emulator'
+if "$LEASE_TOOL" acquire --avd avd_shared --writable --owner and-w --wait 1 --ttl 30 --json >/dev/null 2>&1; then
+    fail 'a writable lease booted an AVD that another lease was running'
+fi
+"$LEASE_TOOL" release --token "$TOKEN_A" >/dev/null
+TOKEN_A=""
+AND_W="$("$LEASE_TOOL" acquire --avd avd_shared --writable --owner and-w --ttl 2 --json)"
+[[ "$(jq -r '.writable' <<<"$AND_W")" == 'true' ]] || fail 'a writable lease was not writable'
+sleep 4
+[[ ! -f "${SIMLEASE_ANDROID_TEST_STATE_DIR}/emulator-5560.running" ]] || fail 'an expired emulator lease left its emulator running'
+"$LEASE_TOOL" acquire --avd no_such_avd --owner and-x --json >/dev/null 2>"${TEST_ROOT}/no-avd.err" \
+    && fail 'an unknown AVD was leased'
+grep -q "no AVD named 'no_such_avd'" "${TEST_ROOT}/no-avd.err" || fail 'an unknown AVD failed for the wrong reason'
+BOOT_STARTED="$(date +%s)"
+SIMLEASE_TEST_ANDROID_BOOT_FAILS=true "$LEASE_TOOL" acquire --avd avd_shared --owner and-fail --wait 30 --json \
+    >/dev/null 2>"${TEST_ROOT}/boot-fail.err" && fail 'a failed emulator boot returned a lease'
+grep -q 'did not boot' "${TEST_ROOT}/boot-fail.err" || fail 'a failed emulator boot was not reported'
+[[ $(( $(date +%s) - BOOT_STARTED )) -lt 20 ]] || fail 'a failed emulator boot kept retrying until --wait ran out'
+[[ -z "$(ls "$SIMLEASE_ANDROID_TEST_STATE_DIR")" ]] || fail 'emulators are still running after the Android tests'
+unset SIMLEASE_ANDROID_TEST_STATE_DIR SIMLEASE_ANDROID_AVDS SIMLEASE_MAX_EMULATORS
 
 printf 'simulator lease tests passed\n'

@@ -122,13 +122,25 @@ simlease exec --token TOKEN -- COMMAND [ARG ...]
 7. Release signals the guard; expiry or stale-lease cleanup makes the simulator available again.
 8. If SimLease started that device, cleanup shuts it down to return its RAM. Devices that were already running are never shut down automatically.
 
-By default, a new Simulator requires at least 4 GB and 15% free memory. The pool cap is one booted Simulator below 16 GB total RAM, two below 32 GB, and three at 32 GB or more. Advanced users can tune `SIMLEASE_MIN_FREE_MEMORY_MB`, `SIMLEASE_MIN_FREE_MEMORY_PERCENT`, and `SIMLEASE_MAX_BOOTED_SIMULATORS`.
+By default, a new Simulator requires at least 4 GB and 15% free memory. With [simslim](https://github.com/mobai-app/simslim) installed, the pool cap is two booted Simulators below 16 GB total RAM, three below 32 GB, four below 64 GB and six at 64 GB; without it, one, two and three. Advanced users can tune `SIMLEASE_MIN_FREE_MEMORY_MB`, `SIMLEASE_MIN_FREE_MEMORY_PERCENT`, `SIMLEASE_MAX_BOOTED_SIMULATORS` and `SIMLEASE_MAX_EMULATORS`.
+
+## Slim Simulators
+
+When `simslim` is on `PATH`, every acquire makes the leased Simulator match one shared profile, `~/.config/simlease/simslim-profile.json` (`{"except": [...], "keep": [...]}`, created by the installer with `photos`, `store`, `icloud` and `web` kept). A matching Simulator costs a one-second check; any other is reconfigured and rebooted slim once, in 10-25 s. A slim Simulator idles at about 0.4-1 GB instead of about 4 GB. One profile for every project matters because slimming persists on the device: a Simulator slimmed for one project must still run the next project's app. A lease that needs more services adds them with `--keep-services widgets,siri`. `SIMLEASE_SLIM=0` turns slimming off.
+
+`~/.config/simlease/pinned` lists Simulator UDIDs that automatic picks skip, such as a signed-in test device or one with seeded photos. `--device <UDID>` still leases a pinned Simulator.
+
+## Android emulators
+
+`simlease acquire --avd NAME` leases an Android emulator the same way. Each lease boots its own instance of the AVD on a free even port from 5560 (console port, adb port+1, gRPC port+3000), so leases never share an emulator. Instances run read-only by default, which lets any number of leases use one AVD and never changes it; `--writable` boots the AVD writable and waits until no other instance of it runs. Emulators run headless unless `--window` is passed. `simlease exec` exports `ANDROID_SERIAL`, which `adb`, `flutter` and Gradle all honour, plus `ANDROID_AVD_NAME`, `ANDROID_EMULATOR_PORT` and `ANDROID_EMULATOR_GRPC_PORT`. Release or expiry stops the emulator. Boots are serialized under their own pool lock, so a slow emulator boot never delays a Simulator lease.
 
 Runtime state defaults to `${TMPDIR}/simlease`. Override it with `SIMLEASE_DIR` when necessary. Every cooperating process must use the same state directory. SimLease also keeps private, versioned guard executables under `${TMPDIR}/simlease-runtime` so `launchd` can run leases acquired from TCC-protected project directories.
 
 ## Automatic Codex protection
 
-The skill is eligible for implicit use whenever Codex recognizes iOS Simulator work. A bundled `PreToolUse` hook also guards direct `simctl`, Simulator `xcodebuild`, `serve-sim`, and Simulator MCP calls. It tells the agent to acquire a lease instead of silently letting one task interfere with another.
+The skill is eligible for implicit use whenever Codex recognizes iOS Simulator work. A bundled `PreToolUse` hook also guards direct `simctl`, Simulator `xcodebuild`, `serve-sim`, Simulator MCP calls, emulator boots and `adb` or `flutter` commands aimed at an emulator. It tells the agent to acquire a lease instead of silently letting one task interfere with another. It also blocks, even inside a lease, commands that hit every agent's devices: `simctl ... all`, `simctl ... booted`, `simslim on/off`, `killall` of Simulators or emulators, unscoped `pkill`, and `adb kill-server`.
+
+`./scripts/install.sh --with-claude-hook` installs the same guard for Claude Code as `~/.claude/hooks/simlease_guard_claude.py`; register it as a `PreToolUse` hook for `Bash` and Simulator tools.
 
 Codex requires each user to review and trust a newly installed or changed hook with `/hooks`. This is a one-time safety step for each hook version.
 

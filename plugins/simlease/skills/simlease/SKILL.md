@@ -46,6 +46,11 @@ Before the first simulator operation in a task, run `scripts/preflight`. If it f
 
 After acquisition, tell the user which named Simulator is reserved. If `bootedBySimLease` is true, also say `🚀 Started <device> because every running Simulator was busy.` After cleanup, confirm that it was released; if release reports `shutDown: true`, say `💤 Shut down <device> to release its RAM.` Do not expose the lease token in commentary or the final response.
 
+## Slimming and Android
+
+- Every leased Simulator is slimmed with simslim against the shared profile. Never run `simslim on`/`off` yourself; ask for extra services with `--keep-services <categories>` on acquire.
+- Android emulators: `scripts/simlease acquire --avd <AVD> --owner <task> --wait 600 --token-file <file> --json`, then `scripts/simlease exec --token-file <file> -- adb ...` or `-- sh -c 'flutter run -d "$ANDROID_SERIAL"'` (single quotes: the lease sets the variable, not the calling shell). Never boot an emulator or aim `adb` at one outside a lease.
+
 ## Tool-specific rules
 
 - For XcodeBuildMCP, set `simulatorId` to the leased UDID before every simulator tool call. Use the returned `derivedDataPath` for builds when the tool supports it.
