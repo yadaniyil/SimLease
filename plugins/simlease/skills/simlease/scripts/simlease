@@ -15,32 +15,71 @@ SERVE_SIM_STATE_DIR="${SIMLEASE_SERVE_SIM_STATE_DIR:-${TMPDIR:-/tmp}/serve-sim}"
 DEFAULT_TTL_SECONDS="${SIMLEASE_TTL_SECONDS:-3600}"
 MIN_FREE_MEMORY_MB="${SIMLEASE_MIN_FREE_MEMORY_MB:-4096}"
 MIN_FREE_MEMORY_PERCENT="${SIMLEASE_MIN_FREE_MEMORY_PERCENT:-15}"
-SIMLEASE_VERSION="0.2.1"
+CONFIG_DIR="${SIMLEASE_CONFIG_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/simlease}"
+# One simslim profile for every project: a Simulator slimmed for one project must
+# still run every other project's app.
+SIMSLIM_PROFILE="${SIMLEASE_SIMSLIM_PROFILE:-${CONFIG_DIR}/simslim-profile.json}"
+DEFAULT_SIMSLIM_EXCEPT='photos,store,icloud,web'
+# Simulators with state worth keeping (signed in, seeded media). Automatic picks
+# skip them; `--device <UDID>` still leases one.
+PINNED_FILE="${SIMLEASE_PINNED_FILE:-${CONFIG_DIR}/pinned}"
+ANDROID_SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-${HOME}/Library/Android/sdk}}"
+ANDROID_FIRST_PORT="${SIMLEASE_ANDROID_FIRST_PORT:-5560}"
+ANDROID_LAST_PORT="${SIMLEASE_ANDROID_LAST_PORT:-5680}"
+ANDROID_BOOT_TIMEOUT_SECONDS="${SIMLEASE_ANDROID_BOOT_TIMEOUT_SECONDS:-420}"
+SIMLEASE_VERSION="0.3.0"
 
 usage() {
     cat <<'EOF'
 Usage:
-  simlease acquire --owner NAME [options]
+  simlease acquire --owner NAME [options]                 iOS Simulator
+  simlease acquire --android --avd NAME --owner NAME [options]   Android emulator
   simlease status [--json]
   simlease renew --token TOKEN [--ttl SECONDS] [--json]
   simlease release --token TOKEN [--json]
   simlease exec --token TOKEN -- COMMAND [ARG ...]
 
+renew, release and exec also take --token-file PATH in place of --token TOKEN.
+exec keeps renewing the lease while COMMAND runs, so a long run outlives the TTL.
+exec exports SIMULATOR_UDID, SIMULATOR_NAME and DERIVED_DATA_PATH for a Simulator,
+or ANDROID_SERIAL, ANDROID_AVD_NAME, ANDROID_EMULATOR_PORT and
+ANDROID_EMULATOR_GRPC_PORT for an emulator.
+
 Acquire options:
   --owner NAME       Required task or agent identifier.
   --purpose TEXT     Short description shown in lease status.
-  --device UUID      Claim only this booted simulator.
   --ttl SECONDS      Lease lifetime; defaults to 3600 seconds.
-  --wait SECONDS     Wait for a simulator; defaults to 0.
-  --boot-if-needed   Boot one additional Simulator when the pool is busy and memory permits.
+  --wait SECONDS     Wait for a device; defaults to 0.
+  --token-file PATH  Also write the token to PATH (mode 600). Refuses a file that
+                     still holds an active lease's token.
   --json             Emit machine-readable JSON.
+Simulator options:
+  --device UUID      Claim only this simulator (the only way to lease a pinned one).
+  --boot-if-needed   Boot one additional Simulator when the pool is busy and memory permits.
+  --keep-services C  simslim categories this lease also needs running, on top of
+                     the shared profile (e.g. widgets,siri).
+Emulator options:
+  --android          Lease an Android emulator: simlease boots a fresh instance of
+                     the AVD on a free port and stops it on release or expiry.
+  --avd NAME         The AVD to boot (implies --android; default SIMLEASE_ANDROID_AVD).
+  --writable         Boot the AVD writable (default read-only, which lets many
+                     leases share one AVD and never changes it). Waits until no
+                     other instance of that AVD runs.
+  --window           Show the emulator window (default headless).
+  --emulator-args A  Extra emulator flags, e.g. "-camera-back emulated -gpu swiftshader_indirect".
+
+Every leased Simulator is slimmed with simslim. The shared profile is
+~/.config/simlease/simslim-profile.json ({"except": [...], "keep": [...]}; default
+except: photos,store,icloud,web). SIMLEASE_SLIM=0 turns slimming off.
+~/.config/simlease/pinned lists Simulator UDIDs automatic picks skip.
 
 SIMLEASE_DIR overrides the shared state directory.
 SIMLEASE_WORKSPACE overrides the workspace recorded in lease metadata.
 SIMLEASE_DEVICES may contain test-only TSV device rows.
 SIMLEASE_MIN_FREE_MEMORY_MB defaults to 4096.
 SIMLEASE_MIN_FREE_MEMORY_PERCENT defaults to 15.
-SIMLEASE_MAX_BOOTED_SIMULATORS overrides the RAM-derived pool cap.
+SIMLEASE_MAX_BOOTED_SIMULATORS overrides the RAM-derived pool cap (6 slim Simulators on 64 GB).
+SIMLEASE_MAX_EMULATORS overrides the emulator cap (4 on 64 GB).
 EOF
 }
 
@@ -181,10 +220,120 @@ shutdown_devices() {
         | [.udid, .name] | @tsv'
 }
 
+is_android_id() {
+    [[ "$1" == emulator-* ]]
+}
+
+android_tool() {
+    case "$1" in
+        adb) printf '%s\n' "${SIMLEASE_ADB:-${ANDROID_SDK}/platform-tools/adb}" ;;
+        emulator) printf '%s\n' "${SIMLEASE_EMULATOR:-${ANDROID_SDK}/emulator/emulator}" ;;
+    esac
+}
+
+android_avds() {
+    if [[ -n "${SIMLEASE_ANDROID_AVDS:-}" ]]; then
+        printf '%s\n' "$SIMLEASE_ANDROID_AVDS"
+        return
+    fi
+    "$(android_tool emulator)" -list-avds 2>/dev/null | awk 'NF && $0 !~ /^INFO/'
+}
+
+android_port_in_use() {
+    local port="$1"
+    if [[ -n "${SIMLEASE_ANDROID_TEST_STATE_DIR:-}" ]]; then
+        [[ -f "${SIMLEASE_ANDROID_TEST_STATE_DIR}/emulator-${port}.running" ]]
+        return
+    fi
+    # Console port, adb port (port+1) and gRPC port (port+3000) must all be free.
+    lsof -nP -iTCP:"$port" -iTCP:"$(( port + 1 ))" -iTCP:"$(( port + 3000 ))" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+android_running_count() {
+    if [[ -n "${SIMLEASE_ANDROID_TEST_STATE_DIR:-}" ]]; then
+        find "$SIMLEASE_ANDROID_TEST_STATE_DIR" -name 'emulator-*.running' 2>/dev/null | awk 'END {print NR}'
+        return
+    fi
+    "$(android_tool adb)" devices 2>/dev/null | awk '$1 ~ /^emulator-/ {count++} END {print count+0}'
+}
+
+# An AVD runs writable in one instance at most, and only when no instance runs.
+android_avd_is_running() {
+    local avd="$1"
+    if [[ -n "${SIMLEASE_ANDROID_TEST_STATE_DIR:-}" ]]; then
+        grep -qx -- "$avd" "${SIMLEASE_ANDROID_TEST_STATE_DIR}"/*.running 2>/dev/null
+        return
+    fi
+    pgrep -f -- "qemu-system.* -avd ${avd}( |$)" >/dev/null 2>&1 \
+        || pgrep -f -- "emulator.* -avd ${avd}( |$)" >/dev/null 2>&1
+}
+
+android_boot() {
+    local serial="$1"
+    local avd="$2"
+    local port="${serial#emulator-}"
+    local adb
+    local emulator_pid
+    local deadline
+    local log_file="${LEASE_ROOT}/android-logs/${serial}.log"
+    local -a arguments
+
+    if [[ -n "${SIMLEASE_ANDROID_TEST_STATE_DIR:-}" ]]; then
+        mkdir -p "$SIMLEASE_ANDROID_TEST_STATE_DIR"
+        [[ "${SIMLEASE_TEST_ANDROID_BOOT_FAILS:-false}" != "true" ]] || return 1
+        printf '%s\n' "$avd" > "${SIMLEASE_ANDROID_TEST_STATE_DIR}/${serial}.running"
+        return 0
+    fi
+
+    mkdir -p "${LEASE_ROOT}/android-logs"
+    arguments=(-avd "$avd" -port "$port" -grpc "$(( port + 3000 ))" -no-snapshot-save -no-boot-anim)
+    [[ "${SIMLEASE_ANDROID_WRITABLE:-false}" == "true" ]] || arguments+=(-read-only)
+    [[ "${SIMLEASE_ANDROID_WINDOW:-false}" == "true" ]] || arguments+=(-no-window)
+    # Extra emulator flags (camera, GPU), split on spaces; -port and -avd stay simlease's.
+    if [[ -n "${SIMLEASE_ANDROID_EXTRA_ARGS:-}" ]]; then
+        # shellcheck disable=SC2206 # Word splitting is the point.
+        arguments+=(${SIMLEASE_ANDROID_EXTRA_ARGS})
+    fi
+    "$(android_tool emulator)" "${arguments[@]}" > "$log_file" 2>&1 < /dev/null &
+    emulator_pid=$!
+    adb="$(android_tool adb)"
+    deadline=$(( $(date +%s) + ANDROID_BOOT_TIMEOUT_SECONDS ))
+    while [[ "$(date +%s)" -lt "$deadline" ]]; do
+        kill -0 "$emulator_pid" 2>/dev/null || return 1
+        if [[ "$("$adb" -s "$serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == "1" ]]; then
+            return 0
+        fi
+        sleep 2
+    done
+    android_shutdown "$serial"
+    return 1
+}
+
+android_shutdown() {
+    local serial="$1"
+    local port="${serial#emulator-}"
+    local _attempt
+    if [[ -n "${SIMLEASE_ANDROID_TEST_STATE_DIR:-}" ]]; then
+        rm -f "${SIMLEASE_ANDROID_TEST_STATE_DIR}/${serial}.running"
+        return 0
+    fi
+    "$(android_tool adb)" -s "$serial" emu kill >/dev/null 2>&1 || true
+    for _attempt in $(seq 1 40); do
+        pgrep -f -- "qemu-system.* -port ${port}( |$)" >/dev/null 2>&1 || return 0
+        sleep 0.5
+    done
+    pkill -f -- "qemu-system.* -port ${port}( |$)" >/dev/null 2>&1 || true
+}
+
 boot_device() {
     local udid="$1"
+    if is_android_id "$udid"; then
+        android_boot "$udid" "${2:-}"
+        return
+    fi
     if [[ -n "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]]; then
         mkdir -p "$SIMLEASE_TEST_DEVICE_STATE_DIR"
+        sleep "${SIMLEASE_TEST_BOOT_DELAY_SECONDS:-0}"
         : > "${SIMLEASE_TEST_DEVICE_STATE_DIR}/${udid}.booted"
         return 0
     fi
@@ -193,6 +342,10 @@ boot_device() {
 
 shutdown_device() {
     local udid="$1"
+    if is_android_id "$udid"; then
+        android_shutdown "$udid"
+        return
+    fi
     if [[ -n "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]]; then
         rm -f "${SIMLEASE_TEST_DEVICE_STATE_DIR}/${udid}.booted"
         return 0
@@ -220,6 +373,13 @@ max_booted_simulators() {
     local total_mb="$1"
     if [[ -n "${SIMLEASE_MAX_BOOTED_SIMULATORS:-}" ]]; then
         printf '%s\n' "$SIMLEASE_MAX_BOOTED_SIMULATORS"
+    elif slimming_enabled; then
+        # Every leased Simulator is slimmed: ~0.4-1 GB instead of ~4 GB.
+        if [[ "$total_mb" -lt 16384 ]]; then printf '2\n'
+        elif [[ "$total_mb" -lt 32768 ]]; then printf '3\n'
+        elif [[ "$total_mb" -lt 65536 ]]; then printf '4\n'
+        else printf '6\n'
+        fi
     elif [[ "$total_mb" -lt 16384 ]]; then
         printf '1\n'
     elif [[ "$total_mb" -lt 32768 ]]; then
@@ -229,7 +389,82 @@ max_booted_simulators() {
     fi
 }
 
+max_emulators() {
+    local total_mb="$1"
+    if [[ -n "${SIMLEASE_MAX_EMULATORS:-}" ]]; then
+        printf '%s\n' "$SIMLEASE_MAX_EMULATORS"
+    elif [[ "$total_mb" -lt 16384 ]]; then printf '1\n'
+    elif [[ "$total_mb" -lt 32768 ]]; then printf '2\n'
+    elif [[ "$total_mb" -lt 65536 ]]; then printf '3\n'
+    else printf '4\n'
+    fi
+}
+
+# Prints the simslim binary when leased Simulators should be slimmed. Test runs
+# use fake devices, so they slim only through an explicit fake binary.
+simslim_binary() {
+    [[ "${SIMLEASE_SLIM:-1}" != "0" ]] || return 1
+    if [[ -n "${SIMLEASE_SIMSLIM_BIN:-}" ]]; then
+        printf '%s\n' "$SIMLEASE_SIMSLIM_BIN"
+        return 0
+    fi
+    [[ -z "${SIMLEASE_DEVICES:-}" ]] || return 1
+    command -v simslim
+}
+
+slimming_enabled() {
+    simslim_binary >/dev/null 2>&1
+}
+
+# The service categories a lease keeps running: the shared profile's "except"
+# list plus this lease's --keep-services.
+kept_services() {
+    local base="$DEFAULT_SIMSLIM_EXCEPT"
+    if [[ -f "$SIMSLIM_PROFILE" ]]; then
+        base="$(jq -r '(.except // []) | join(",")' "$SIMSLIM_PROFILE" 2>/dev/null || printf '%s' "$DEFAULT_SIMSLIM_EXCEPT")"
+    fi
+    printf '%s,%s\n' "$base" "${SIMLEASE_KEEP_SERVICES:-}" | tr ',' '\n' | awk 'NF && !seen[$0]++' | paste -sd ',' -
+}
+
+# Makes a leased, booted Simulator match the shared profile (plus this lease's
+# --keep-services) and prints the outcome: verified (already matched), applied
+# (reconfigured and rebooted, about 10-25 s), failed, or off.
+ensure_slim() {
+    local udid="$1"
+    local device_name="$2"
+    local simslim_bin
+    local kept
+    local kept_daemons=""
+    local -a arguments
+
+    simslim_bin="$(simslim_binary)" || { printf 'off\n'; return 0; }
+    kept="$(kept_services)"
+    arguments=(--except "$kept")
+    if [[ -f "$SIMSLIM_PROFILE" ]]; then
+        kept_daemons="$(jq -r '(.keep // []) | join(",")' "$SIMSLIM_PROFILE" 2>/dev/null || true)"
+    fi
+    [[ -z "$kept_daemons" ]] || arguments+=(--keep "$kept_daemons")
+    if "$simslim_bin" verify "$udid" "${arguments[@]}" >/dev/null 2>&1; then
+        printf 'verified\n'
+        return 0
+    fi
+    printf 'simlease: slimming %s, keeping %s (about 10-25 s)\n' "$device_name" "$kept" >&2
+    if "$simslim_bin" on "$udid" "${arguments[@]}" >/dev/null 2>&1; then
+        printf 'applied\n'
+    else
+        printf 'simlease: simslim could not slim %s; it stays stock\n' "$device_name" >&2
+        printf 'failed\n'
+    fi
+}
+
+is_pinned() {
+    local udid="$1"
+    [[ -f "$PINNED_FILE" ]] || return 1
+    awk -v wanted="$udid" '{ sub(/#.*/, ""); gsub(/[[:space:]]/, "") } $0 == wanted { found=1 } END { exit !found }' "$PINNED_FILE"
+}
+
 capacity_json() {
+    local platform="${1:-ios}"
     local total_mb
     local free_percent
     local free_mb
@@ -244,9 +479,15 @@ capacity_json() {
     [[ "$free_percent" =~ ^[0-9]+$ ]] || free_percent=0
     require_nonnegative_integer 'SIMLEASE_MIN_FREE_MEMORY_MB' "$MIN_FREE_MEMORY_MB"
     require_nonnegative_integer 'SIMLEASE_MIN_FREE_MEMORY_PERCENT' "$MIN_FREE_MEMORY_PERCENT"
-    booted_count="$(booted_devices | awk 'NF {count++} END {print count+0}')"
-    max_booted="$(max_booted_simulators "$total_mb")"
-    require_positive_integer 'SIMLEASE_MAX_BOOTED_SIMULATORS' "$max_booted"
+    if [[ "$platform" == "android" ]]; then
+        booted_count="$(android_running_count)"
+        max_booted="$(max_emulators "$total_mb")"
+        require_positive_integer 'SIMLEASE_MAX_EMULATORS' "$max_booted"
+    else
+        booted_count="$(booted_devices | awk 'NF {count++} END {print count+0}')"
+        max_booted="$(max_booted_simulators "$total_mb")"
+        require_positive_integer 'SIMLEASE_MAX_BOOTED_SIMULATORS' "$max_booted"
+    fi
     free_mb=$(( total_mb * free_percent / 100 ))
 
     if [[ "$total_mb" -eq 0 || "$free_percent" -eq 0 ]]; then
@@ -254,7 +495,7 @@ capacity_json() {
         reason='memory-pressure-unavailable'
     elif [[ "$booted_count" -ge "$max_booted" ]]; then
         can_boot=false
-        reason='booted-simulator-limit'
+        if [[ "$platform" == "android" ]]; then reason='emulator-limit'; else reason='booted-simulator-limit'; fi
     elif [[ "$free_mb" -lt "$MIN_FREE_MEMORY_MB" || "$free_percent" -lt "$MIN_FREE_MEMORY_PERCENT" ]]; then
         can_boot=false
         reason='insufficient-free-memory'
@@ -446,7 +687,7 @@ guard_lease() {
     local ready_file="${HANDSHAKE_DIR}/${hashed_token}.ready"
     local acknowledged_file="${HANDSHAKE_DIR}/${hashed_token}.ack"
     local release_file="${SIGNAL_DIR}/${hashed_token}.release"
-    local acknowledgement_deadline=$(( $(date +%s) + 5 ))
+    local acknowledgement_deadline
     local current_expiry
 
     metadata="$(metadata_path_for_udid "$udid")"
@@ -465,10 +706,13 @@ guard_lease() {
         "$guard_label"
 
     if [[ "$booted_by_simlease" == "true" ]]; then
-        boot_device "$udid" || exit 1
+        boot_device "$udid" "$device_name" || exit 1
         jq '.lifecycleState = "leased"' "$metadata" > "${metadata}.booted.$$"
         mv "${metadata}.booted.$$" "$metadata"
     fi
+    # Start the handshake clock only after booting; a Simulator boot can take
+    # far longer than the acknowledgement window.
+    acknowledgement_deadline=$(( $(date +%s) + 5 ))
     : > "$ready_file"
 
     while [[ ! -f "$acknowledged_file" ]]; do
@@ -523,6 +767,8 @@ try_acquire_device() {
     local guard_label
     local -a guard_environment
     local runtime_script
+    local handshake_attempts
+    local slim_state='n/a'
     local _attempt
 
     remove_metadata_if_stale "$udid"
@@ -548,6 +794,25 @@ try_acquire_device() {
     )
     if [[ -n "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]]; then
         guard_environment+=("SIMLEASE_TEST_DEVICE_STATE_DIR=${SIMLEASE_TEST_DEVICE_STATE_DIR}")
+        guard_environment+=("SIMLEASE_TEST_BOOT_DELAY_SECONDS=${SIMLEASE_TEST_BOOT_DELAY_SECONDS:-0}")
+    fi
+    handshake_attempts="${SIMLEASE_ACQUIRE_HANDSHAKE_ATTEMPTS:-1800}"
+    if is_android_id "$udid"; then
+        guard_environment+=(
+            "HOME=${HOME}"
+            "ANDROID_SDK_ROOT=${ANDROID_SDK}"
+            "SIMLEASE_ANDROID_WRITABLE=${SIMLEASE_ANDROID_WRITABLE:-false}"
+            "SIMLEASE_ANDROID_WINDOW=${SIMLEASE_ANDROID_WINDOW:-false}"
+            "SIMLEASE_ANDROID_EXTRA_ARGS=${SIMLEASE_ANDROID_EXTRA_ARGS:-}"
+            "SIMLEASE_ANDROID_BOOT_TIMEOUT_SECONDS=${ANDROID_BOOT_TIMEOUT_SECONDS}"
+        )
+        [[ -z "${ANDROID_AVD_HOME:-}" ]] || guard_environment+=("ANDROID_AVD_HOME=${ANDROID_AVD_HOME}")
+        [[ -z "${SIMLEASE_ANDROID_TEST_STATE_DIR:-}" ]] || guard_environment+=(
+            "SIMLEASE_ANDROID_TEST_STATE_DIR=${SIMLEASE_ANDROID_TEST_STATE_DIR}"
+            "SIMLEASE_TEST_ANDROID_BOOT_FAILS=${SIMLEASE_TEST_ANDROID_BOOT_FAILS:-false}"
+        )
+        # A cold emulator boot takes minutes, far longer than a Simulator boot.
+        handshake_attempts=$(( ANDROID_BOOT_TIMEOUT_SECONDS * 20 + 1200 ))
     fi
 
     if ! launchctl submit -l "$guard_label" -o /dev/null -e /dev/null -- \
@@ -558,10 +823,31 @@ try_acquire_device() {
         return 1
     fi
 
-    for _attempt in $(seq 1 "${SIMLEASE_ACQUIRE_HANDSHAKE_ATTEMPTS:-1800}"); do
+    for _attempt in $(seq 1 "$handshake_attempts"); do
         if [[ -f "$ready_file" ]]; then
+            # Save the token before acknowledging: if it cannot be saved, the
+            # unacknowledged guard gives the device back instead of leaking it.
+            if [[ -n "${SIMLEASE_TOKEN_FILE_OUT:-}" ]] \
+                && ! ( umask 077; printf '%s\n' "$token" > "$SIMLEASE_TOKEN_FILE_OUT" ) 2>/dev/null; then
+                remove_launchd_job "$guard_label"
+                rm -f "$ready_file"
+                fail "could not write the token to '${SIMLEASE_TOKEN_FILE_OUT}'"
+            fi
             : > "$acknowledged_file"
-            if [[ "$output_json" == "true" ]]; then
+            is_android_id "$udid" || slim_state="$(ensure_slim "$udid" "$device_name")"
+            if [[ "$output_json" == "true" ]] && is_android_id "$udid"; then
+                jq -n \
+                    --arg token "$token" \
+                    --arg serial "$udid" \
+                    --arg avd "$device_name" \
+                    --arg owner "$owner" \
+                    --arg purpose "$purpose" \
+                    --arg expiresAt "$(utc_timestamp "$expires_epoch")" \
+                    --argjson expiresAtEpoch "$expires_epoch" \
+                    --argjson port "${udid#emulator-}" \
+                    --argjson writable "${SIMLEASE_ANDROID_WRITABLE:-false}" \
+                    '{platform:"android",token:$token,udid:$serial,serial:$serial,deviceName:$avd,avd:$avd,port:$port,grpcPort:($port+3000),writable:$writable,owner:$owner,purpose:$purpose,expiresAt:$expiresAt,expiresAtEpoch:$expiresAtEpoch,bootedBySimLease:true}'
+            elif [[ "$output_json" == "true" ]]; then
                 jq -n \
                     --arg token "$token" \
                     --arg udid "$udid" \
@@ -570,10 +856,21 @@ try_acquire_device() {
                     --arg purpose "$purpose" \
                     --arg derivedDataPath "$derived_data_path" \
                     --arg expiresAt "$(utc_timestamp "$expires_epoch")" \
+                    --arg slim "$slim_state" \
+                    --arg keptServices "$(kept_services)" \
                     --argjson bootedBySimLease "$booted_by_simlease" \
                     --argjson serveSimAlreadyRunning "$serve_sim_already_running" \
                     --argjson expiresAtEpoch "$expires_epoch" \
-                    '{token:$token,udid:$udid,deviceName:$deviceName,owner:$owner,purpose:$purpose,derivedDataPath:$derivedDataPath,expiresAt:$expiresAt,expiresAtEpoch:$expiresAtEpoch,bootedBySimLease:$bootedBySimLease,serveSimAlreadyRunning:$serveSimAlreadyRunning}'
+                    '{platform:"ios",token:$token,udid:$udid,deviceName:$deviceName,owner:$owner,purpose:$purpose,derivedDataPath:$derivedDataPath,expiresAt:$expiresAt,expiresAtEpoch:$expiresAtEpoch,bootedBySimLease:$bootedBySimLease,serveSimAlreadyRunning:$serveSimAlreadyRunning,slim:$slim,keptServices:$keptServices}'
+            elif is_android_id "$udid"; then
+                printf 'Emulator lease acquired\n'
+                printf '  AVD:          %s (%s)\n' "$device_name" "$([[ "${SIMLEASE_ANDROID_WRITABLE:-false}" == "true" ]] && printf 'writable' || printf 'read-only')"
+                printf '  Serial:       %s\n' "$udid"
+                printf '  gRPC port:    %s\n' "$(( ${udid#emulator-} + 3000 ))"
+                printf '  Owner:        %s\n' "$owner"
+                printf '  Purpose:      %s\n' "${purpose:--}"
+                printf '  Expires:      %s\n' "$(utc_timestamp "$expires_epoch")"
+                printf '  Token:        %s\n' "$token"
             else
                 printf 'Simulator lease acquired\n'
                 printf '  Device:       %s\n' "$device_name"
@@ -583,6 +880,7 @@ try_acquire_device() {
                 printf '  Expires:      %s\n' "$(utc_timestamp "$expires_epoch")"
                 printf '  DerivedData:  %s\n' "$derived_data_path"
                 printf '  Started:      %s\n' "$booted_by_simlease"
+                printf '  Slim:         %s\n' "$slim_state"
                 printf '  serve-sim:    %s\n' "$serve_sim_already_running"
                 printf '  Token:        %s\n' "$token"
             fi
@@ -620,6 +918,7 @@ scale_and_acquire() {
     while IFS=$'\t' read -r udid device_name; do
         [[ -n "$udid" ]] || continue
         [[ -z "$requested_device" || "$requested_device" == "$udid" ]] || continue
+        [[ -n "$requested_device" ]] || ! is_pinned "$udid" || continue
         if try_acquire_device "$udid" "$device_name" "$owner" "$purpose" "$ttl_seconds" "$output_json" false; then
             return 0
         fi
@@ -630,11 +929,90 @@ scale_and_acquire() {
     while IFS=$'\t' read -r udid device_name; do
         [[ -n "$udid" ]] || continue
         [[ -z "$requested_device" || "$requested_device" == "$udid" ]] || continue
+        [[ -n "$requested_device" ]] || ! is_pinned "$udid" || continue
         if try_acquire_device "$udid" "$device_name" "$owner" "$purpose" "$ttl_seconds" "$output_json" true; then
             return 0
         fi
     done < <(shutdown_devices)
     return 1
+}
+
+# Every Android lease boots its own emulator instance on a free port. Shared
+# AVDs run read-only, so any number of leases can use the same AVD at once.
+# Exit status: 0 leased, 1 no capacity or no free port (retry), 2 boot failed.
+android_scale_and_acquire() {
+    local owner="$1"
+    local purpose="$2"
+    local avd="$3"
+    local ttl_seconds="$4"
+    local output_json="$5"
+    local capacity
+    local port
+    local serial
+    local log_file
+
+    capacity="$(capacity_json android)"
+    [[ "$(jq -r '.canBootAnother' <<< "$capacity")" == "true" ]] || return 1
+    if [[ "${SIMLEASE_ANDROID_WRITABLE:-false}" == "true" ]] && android_avd_is_running "$avd"; then
+        return 1
+    fi
+    for (( port = ANDROID_FIRST_PORT; port <= ANDROID_LAST_PORT; port += 2 )); do
+        serial="emulator-${port}"
+        probe_lock_is_free "$serial" || continue
+        [[ ! -f "$(metadata_path_for_udid "$serial")" ]] || continue
+        ! android_port_in_use "$port" || continue
+        if try_acquire_device "$serial" "$avd" "$owner" "$purpose" "$ttl_seconds" "$output_json" true; then
+            return 0
+        fi
+        log_file="${LEASE_ROOT}/android-logs/${serial}.log"
+        printf 'simlease: emulator %s (AVD %s) did not boot\n' "$serial" "$avd" >&2
+        [[ ! -s "$log_file" ]] || tail -5 "$log_file" >&2
+        return 2
+    done
+    return 1
+}
+
+acquire_android_lease() {
+    local owner="$1"
+    local purpose="$2"
+    local avd="$3"
+    local ttl_seconds="$4"
+    local wait_seconds="$5"
+    local output_json="$6"
+    local started_at
+    local status
+    local reported=false
+
+    [[ -n "$avd" ]] || avd="${SIMLEASE_ANDROID_AVD:-}"
+    [[ -n "$avd" ]] || fail "--android needs --avd NAME (or SIMLEASE_ANDROID_AVD). AVDs: $(android_avds | paste -sd ' ' -)"
+    android_avds | grep -qx -- "$avd" || fail "no AVD named '$avd'. AVDs: $(android_avds | paste -sd ' ' -)"
+    [[ -n "${SIMLEASE_ANDROID_TEST_STATE_DIR:-}" || -x "$(android_tool emulator)" ]] \
+        || fail "Android emulator not found at $(android_tool emulator); set ANDROID_SDK_ROOT"
+    started_at="$(date +%s)"
+    while true; do
+        set +e
+        # A separate pool lock: a minutes-long emulator boot must not stall iOS.
+        lockf -t 0 -k "${LOCK_DIR}/android-pool.lock" "$SCRIPT_PATH" __android-scale-and-acquire \
+            "$owner" "$purpose" "$avd" "$ttl_seconds" "$output_json"
+        status=$?
+        set -e
+        [[ "$status" -ne 0 ]] || return 0
+        [[ "$status" -ne 2 ]] || fail "emulator boot failed; log above"
+        if [[ "$reported" == "false" ]]; then
+            case "$(jq -r '.reason' <<< "$(capacity_json android)")" in
+                emulator-limit) printf 'simlease: the emulator limit is reached; waiting for a lease\n' >&2 ;;
+                insufficient-free-memory) printf 'simlease: not enough free memory to boot an emulator; waiting for a lease\n' >&2 ;;
+                *) [[ "${SIMLEASE_ANDROID_WRITABLE:-false}" != "true" ]] \
+                    || printf 'simlease: AVD %s is running elsewhere; a writable lease waits for it\n' "$avd" >&2 ;;
+            esac
+            reported=true
+        fi
+        if [[ $(( $(date +%s) - started_at )) -ge "$wait_seconds" ]]; then
+            status_leases >&2 || true
+            fail 'no emulator could be leased'
+        fi
+        sleep 1
+    done
 }
 
 acquire_lease() {
@@ -645,6 +1023,9 @@ acquire_lease() {
     local wait_seconds=0
     local output_json=false
     local boot_if_needed=false
+    local token_file=""
+    local android=false
+    local avd=""
     local wait_reason_reported=false
     local started_at
     local device_count
@@ -655,12 +1036,19 @@ acquire_lease() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --android) android=true; shift ;;
+            --avd) [[ $# -ge 2 ]] || fail '--avd requires an AVD name'; android=true; avd="$2"; shift 2 ;;
+            --writable) export SIMLEASE_ANDROID_WRITABLE=true; shift ;;
+            --keep-services) [[ $# -ge 2 ]] || fail '--keep-services requires categories'; export SIMLEASE_KEEP_SERVICES="$2"; shift 2 ;;
+            --window) export SIMLEASE_ANDROID_WINDOW=true; shift ;;
+            --emulator-args) [[ $# -ge 2 ]] || fail '--emulator-args requires a value'; export SIMLEASE_ANDROID_EXTRA_ARGS="$2"; shift 2 ;;
             --owner) [[ $# -ge 2 ]] || fail '--owner requires a value'; owner="$2"; shift 2 ;;
             --purpose) [[ $# -ge 2 ]] || fail '--purpose requires a value'; purpose="$2"; shift 2 ;;
             --device) [[ $# -ge 2 ]] || fail '--device requires a UUID'; requested_device="$2"; shift 2 ;;
             --ttl) [[ $# -ge 2 ]] || fail '--ttl requires seconds'; ttl_seconds="$2"; shift 2 ;;
             --wait) [[ $# -ge 2 ]] || fail '--wait requires seconds'; wait_seconds="$2"; shift 2 ;;
             --boot-if-needed) boot_if_needed=true; shift ;;
+            --token-file) [[ $# -ge 2 ]] || fail '--token-file requires a path'; token_file="$2"; shift 2 ;;
             # Compatibility with v0.2.0. Active serve-sim helpers no longer
             # block acquisition, so this former opt-in flag is now a no-op.
             --allow-active-serve-sim) shift ;;
@@ -676,6 +1064,18 @@ acquire_lease() {
     require_positive_integer '--ttl' "$ttl_seconds"
     require_nonnegative_integer '--wait' "$wait_seconds"
     initialize_directories
+    if [[ -n "$token_file" ]]; then
+        prepare_token_file "$token_file"
+        # Exported so the __scale-and-acquire child process writes it too.
+        export SIMLEASE_TOKEN_FILE_OUT="$token_file"
+    fi
+    if [[ "$android" == "true" ]]; then
+        [[ -z "$requested_device" ]] || fail '--device is for Simulators; use --avd NAME for an emulator'
+        acquire_android_lease "$owner" "$purpose" "$avd" "$ttl_seconds" "$wait_seconds" "$output_json"
+        return
+    fi
+    [[ "${SIMLEASE_ANDROID_WRITABLE:-false}" != "true" && "${SIMLEASE_ANDROID_WINDOW:-false}" != "true" ]] \
+        || fail '--writable and --window need --android'
     started_at="$(date +%s)"
 
     while true; do
@@ -687,6 +1087,7 @@ acquire_lease() {
             if [[ -n "$requested_device" && "$requested_device" != "$udid" ]]; then
                 continue
             fi
+            [[ -n "$requested_device" ]] || ! is_pinned "$udid" || continue
             candidate_found=true
             if try_acquire_device "$udid" "$device_name" "$owner" "$purpose" "$ttl_seconds" "$output_json"; then
                 return 0
@@ -751,7 +1152,8 @@ status_json() {
         device_name="$(jq -r '.deviceName // "Unknown simulator"' "$metadata" 2>/dev/null || true)"
         [[ -n "$udid" ]] || continue
         if ! awk -F '\t' -v wanted="$udid" '$1 == wanted { found=1 } END { exit !found }' "$devices_file"; then
-            printf '%s\t%s\tfalse\n' "$udid" "$device_name" >> "$devices_file"
+            # A leased emulator is always running: its lease booted it.
+            printf '%s\t%s\t%s\n' "$udid" "$device_name" "$(is_android_id "$udid" && printf 'true' || printf 'false')" >> "$devices_file"
         fi
     done
 
@@ -788,7 +1190,8 @@ status_json() {
 
     capacity="$(capacity_json)"
     jq -n --arg leaseDirectory "$LEASE_ROOT" --slurpfile devices "$result_file" --argjson capacity "$capacity" \
-        '{leaseDirectory:$leaseDirectory,capacity:$capacity,devices:$devices[0]}'
+        --argjson androidCapacity "$(capacity_json android)" \
+        '{leaseDirectory:$leaseDirectory,capacity:$capacity,androidCapacity:$androidCapacity,devices:$devices[0]}'
     rm -f "$devices_file" "$result_file"
 }
 
@@ -808,7 +1211,8 @@ status_leases() {
     status_json | jq -r '
         if (.devices | length) == 0 then
             "No booted simulators or active leases.\n" +
-            "Capacity: \(.capacity.freeMemoryMB) MB free; can boot another: \(.capacity.canBootAnother) (\(.capacity.reason))"
+            "Capacity: \(.capacity.freeMemoryMB) MB free; can boot another: \(.capacity.canBootAnother) (\(.capacity.reason))\n" +
+            "Emulators: \(.androidCapacity.bootedSimulators)/\(.androidCapacity.maxBootedSimulators) running; can boot another: \(.androidCapacity.canBootAnother) (\(.androidCapacity.reason))"
         else
             (["STATE\tDEVICE\tUUID\tSERVE-SIM\tOWNER\tPURPOSE\tEXPIRES"] +
              [.devices[] |
@@ -821,7 +1225,8 @@ status_leases() {
                     (.lease.purpose // "-"),
                     (.lease.expiresAt // "-")
                 ] | @tsv] +
-             ["Capacity: \(.capacity.freeMemoryMB) MB free; \(.capacity.bootedSimulators)/\(.capacity.maxBootedSimulators) booted; can boot another: \(.capacity.canBootAnother) (\(.capacity.reason))"]) | .[]
+             ["Capacity: \(.capacity.freeMemoryMB) MB free; \(.capacity.bootedSimulators)/\(.capacity.maxBootedSimulators) booted; can boot another: \(.capacity.canBootAnother) (\(.capacity.reason))",
+              "Emulators: \(.androidCapacity.bootedSimulators)/\(.androidCapacity.maxBootedSimulators) running; can boot another: \(.androidCapacity.canBootAnother) (\(.androidCapacity.reason))"]) | .[]
         end'
 }
 
@@ -845,8 +1250,59 @@ renew_by_hash() {
         --argjson ttlSeconds "$ttl_seconds" \
         '.expiresAt=$expiresAt | .expiresAtEpoch=$expiresAtEpoch | .ttlSeconds=$ttlSeconds' \
         "$metadata" > "$temporary"
+    # While jq ran, a release may have removed this lease and a new lease may
+    # have taken the same device file. Never write the old lease back over it.
+    if ! jq -e --arg tokenHash "$hashed_token" '.tokenHash == $tokenHash' "$metadata" >/dev/null 2>&1; then
+        rm -f "$temporary"
+        return 1
+    fi
     mv "$temporary" "$metadata"
     printf '%s\n' "$metadata"
+}
+
+token_from_file() {
+    local file="$1"
+    local token=""
+    [[ -f "$file" ]] || fail "token file '$file' does not exist"
+    IFS= read -r token < "$file" || true
+    [[ -n "$token" ]] || fail "token file '$file' is empty"
+    printf '%s\n' "$token"
+}
+
+# Refuses a token file that still holds a live lease's token: overwriting it
+# would lose the only copy and leak that lease until its TTL runs out.
+prepare_token_file() {
+    local file="$1"
+    local previous=""
+    local metadata
+    if [[ -s "$file" ]]; then
+        IFS= read -r previous < "$file" || true
+        if [[ -n "$previous" ]] \
+            && metadata="$(find_metadata_by_token_hash "$(token_hash "$previous")")" \
+            && metadata_guard_is_alive "$metadata"; then
+            fail "token file '$file' still holds an active lease on $(jq -r '.deviceName' "$metadata"); release it first"
+        fi
+    fi
+    ( umask 077; : > "$file" ) 2>/dev/null || fail "cannot write token file '$file'"
+}
+
+# Renews a lease at a third of its TTL for as long as `watched_pid` runs.
+# `exec` replaces the simlease shell with the command under the same PID, so
+# this renewer (its child) outlives the replacement and watches that PID.
+keep_lease_alive() {
+    local hashed_token="$1"
+    local watched_pid="$2"
+    local interval="$3"
+    local waited=0
+    while kill -0 "$watched_pid" 2>/dev/null; do
+        sleep 1
+        waited=$(( waited + 1 ))
+        [[ "$waited" -ge "$interval" ]] || continue
+        waited=0
+        # An exited command that its parent has not reaped yet is a zombie.
+        [[ "$(ps -o stat= -p "$watched_pid" 2>/dev/null || true)" != Z* ]] || return 0
+        renew_by_hash "$hashed_token" >/dev/null 2>&1 || return 0
+    done
 }
 
 renew_lease() {
@@ -859,6 +1315,7 @@ renew_lease() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --token) [[ $# -ge 2 ]] || fail '--token requires a value'; token="$2"; shift 2 ;;
+            --token-file) [[ $# -ge 2 ]] || fail '--token-file requires a path'; token="$(token_from_file "$2")" || exit 1; shift 2 ;;
             --ttl) [[ $# -ge 2 ]] || fail '--ttl requires seconds'; ttl_seconds="$2"; shift 2 ;;
             --json) output_json=true; shift ;;
             *) fail "unknown renew option '$1'" ;;
@@ -889,6 +1346,7 @@ release_lease() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --token) [[ $# -ge 2 ]] || fail '--token requires a value'; token="$2"; shift 2 ;;
+            --token-file) [[ $# -ge 2 ]] || fail '--token-file requires a path'; token="$(token_from_file "$2")" || exit 1; shift 2 ;;
             --json) output_json=true; shift ;;
             *) fail "unknown release option '$1'" ;;
         esac
@@ -916,6 +1374,10 @@ release_lease() {
         jq -n --arg udid "$udid" --arg deviceName "$device_name" --argjson shutDown "$booted_by_simlease" \
             '{released:true,udid:$udid,deviceName:$deviceName,shutDown:$shutDown}'
     else
+        if is_android_id "$udid"; then
+            printf 'Released emulator lease for %s (%s) and stopped the emulator\n' "$device_name" "$udid"
+            return 0
+        fi
         printf 'Released simulator lease for %s (%s)\n' "$device_name" "$udid"
         if [[ "$booted_by_simlease" == "true" ]]; then
             printf 'Shut down Simulator started by SimLease\n'
@@ -927,10 +1389,13 @@ execute_with_lease() {
     local token=""
     local hashed_token
     local metadata
+    local renew_interval
 
-    [[ "${1:-}" == '--token' ]] || fail 'exec requires --token TOKEN -- COMMAND'
-    [[ $# -ge 2 ]] || fail '--token requires a value'
-    token="$2"
+    case "${1:-}" in
+        --token) [[ $# -ge 2 ]] || fail '--token requires a value'; token="$2" ;;
+        --token-file) [[ $# -ge 2 ]] || fail '--token-file requires a path'; token="$(token_from_file "$2")" || exit 1 ;;
+        *) fail 'exec requires --token TOKEN (or --token-file PATH) -- COMMAND' ;;
+    esac
     shift 2
     [[ "${1:-}" == '--' ]] || fail 'exec requires -- before COMMAND'
     shift
@@ -939,13 +1404,31 @@ execute_with_lease() {
     initialize_directories
     hashed_token="$(token_hash "$token")"
     metadata="$(renew_by_hash "$hashed_token")" || fail 'lease token is invalid or no longer active'
-    export SIMULATOR_UDID
-    export SIMULATOR_NAME
-    export DERIVED_DATA_PATH
     export SIMLEASE_TOKEN="$token"
-    SIMULATOR_UDID="$(jq -r '.udid' "$metadata")"
-    SIMULATOR_NAME="$(jq -r '.deviceName' "$metadata")"
-    DERIVED_DATA_PATH="$(jq -r '.derivedDataPath' "$metadata")"
+    if is_android_id "$(jq -r '.udid' "$metadata")"; then
+        # adb, flutter and Gradle all pick up ANDROID_SERIAL.
+        export ANDROID_SERIAL
+        export ANDROID_AVD_NAME
+        export ANDROID_EMULATOR_PORT
+        export ANDROID_EMULATOR_GRPC_PORT
+        ANDROID_SERIAL="$(jq -r '.udid' "$metadata")"
+        ANDROID_AVD_NAME="$(jq -r '.deviceName' "$metadata")"
+        ANDROID_EMULATOR_PORT="${ANDROID_SERIAL#emulator-}"
+        ANDROID_EMULATOR_GRPC_PORT="$(( ANDROID_EMULATOR_PORT + 3000 ))"
+    else
+        export SIMULATOR_UDID
+        export SIMULATOR_NAME
+        export DERIVED_DATA_PATH
+        SIMULATOR_UDID="$(jq -r '.udid' "$metadata")"
+        SIMULATOR_NAME="$(jq -r '.deviceName' "$metadata")"
+        DERIVED_DATA_PATH="$(jq -r '.derivedDataPath' "$metadata")"
+    fi
+    # Without this, a `flutter run` longer than the TTL loses its Simulator:
+    # the guard shuts it down the moment the lease expires.
+    renew_interval=$(( $(jq -r '.ttlSeconds // 3600' "$metadata") / 3 ))
+    [[ "$renew_interval" -ge 1 ]] || renew_interval=1
+    [[ "$renew_interval" -le 300 ]] || renew_interval=300
+    keep_lease_alive "$hashed_token" "$$" "$renew_interval" </dev/null >/dev/null 2>&1 &
     exec "$@"
 }
 
@@ -967,6 +1450,7 @@ main() {
         __launchd-guard) shift; initialize_directories; launchd_guard_entry "$@" ;;
         __cleanup-stale) shift; initialize_directories; cleanup_stale_metadata_under_lock "$@" ;;
         __scale-and-acquire) shift; initialize_directories; scale_and_acquire "$@" ;;
+        __android-scale-and-acquire) shift; initialize_directories; android_scale_and_acquire "$@" ;;
         --version|-V) printf 'simlease %s\n' "$SIMLEASE_VERSION" ;;
         -h|--help|help|'') usage ;;
         *) fail "unknown command '$1'" ;;
