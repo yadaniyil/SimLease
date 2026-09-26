@@ -9,9 +9,24 @@ export SIMLEASE_DEVICES=$'11111111-1111-1111-1111-111111111111\tiPhone Test One\
 export SIMLEASE_SERVE_SIM_STATE_DIR="${TEST_ROOT}/serve-sim"
 mkdir -p "$SIMLEASE_SERVE_SIM_STATE_DIR"
 
+# macOS /bin/bash 3.2 ignores `set -e` when `[[ ... ]]` fails, so every
+# assertion fails explicitly: `[[ ... ]] || fail 'message'`.
+fail() {
+    printf 'simlease test failed (line %s): %s\n' "${BASH_LINENO[0]}" "$*" >&2
+    exit 1
+}
+
 TOKEN_A=""
 TOKEN_B=""
 TOKEN_C=""
+
+cleanup() {
+    [[ -z "$TOKEN_A" ]] || "$LEASE_TOOL" release --token "$TOKEN_A" >/dev/null 2>&1 || true
+    [[ -z "$TOKEN_B" ]] || "$LEASE_TOOL" release --token "$TOKEN_B" >/dev/null 2>&1 || true
+    [[ -z "$TOKEN_C" ]] || "$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null 2>&1 || true
+    rm -rf "$TEST_ROOT"
+}
+trap cleanup EXIT
 
 BOUNDARY_ROOT="${TEST_ROOT}/process-boundary"
 BOUNDARY_DEVICE=$'66666666-6666-6666-6666-666666666666\tiPhone Tool Boundary'
@@ -78,54 +93,53 @@ SCALING_BOOTED_UDID='55555555-5555-5555-5555-555555555555'
 
     STARTED_LEASE="$("$LEASE_TOOL" acquire --owner scaler --ttl 60 --boot-if-needed --json)"
     STARTED_TOKEN="$(jq -r '.token' <<< "$STARTED_LEASE")"
-    [[ "$(jq -r '.bootedBySimLease' <<< "$STARTED_LEASE")" == 'true' ]]
-    [[ -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]]
+    [[ "$(jq -r '.bootedBySimLease' <<< "$STARTED_LEASE")" == 'true' ]] || fail 'scaler lease did not boot a Simulator'
+    [[ -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]] || fail 'on-demand Simulator is not booted'
     RELEASED="$("$LEASE_TOOL" release --token "$STARTED_TOKEN" --json)"
     STARTED_TOKEN=''
-    [[ "$(jq -r '.shutDown' <<< "$RELEASED")" == 'true' ]]
-    [[ ! -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]]
+    [[ "$(jq -r '.shutDown' <<< "$RELEASED")" == 'true' ]] || fail 'releasing the scaler lease did not shut its Simulator down'
+    [[ ! -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]] || fail 'on-demand Simulator still booted after release'
+
+    # A boot slower than the 5-second acknowledgement window must not drop the lease.
+    SLOW_LEASE="$(SIMLEASE_TEST_BOOT_DELAY_SECONDS=7 "$LEASE_TOOL" acquire --owner slow-scaler --ttl 60 --boot-if-needed --json)"
+    STARTED_TOKEN="$(jq -r '.token' <<< "$SLOW_LEASE")"
+    [[ "$(jq -r '.bootedBySimLease' <<< "$SLOW_LEASE")" == 'true' ]] || fail 'slow lease did not boot a Simulator'
+    sleep 2
+    [[ "$("$LEASE_TOOL" status --json | jq -r --arg udid "$SCALING_BOOTED_UDID" '.devices[] | select(.udid == $udid) | .lease.owner')" == 'slow-scaler' ]] || fail 'slow boot dropped the slow-scaler lease'
+    "$LEASE_TOOL" exec --token "$STARTED_TOKEN" -- true
+    "$LEASE_TOOL" release --token "$STARTED_TOKEN" >/dev/null
+    STARTED_TOKEN=''
+    [[ ! -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]] || fail 'on-demand Simulator still booted after slow lease release'
 
     EXPIRING_LEASE="$("$LEASE_TOOL" acquire --owner expiry-scaler --ttl 2 --boot-if-needed --json)"
-    [[ "$(jq -r '.bootedBySimLease' <<< "$EXPIRING_LEASE")" == 'true' ]]
+    [[ "$(jq -r '.bootedBySimLease' <<< "$EXPIRING_LEASE")" == 'true' ]] || fail 'expiring lease did not boot a Simulator'
     sleep 3
-    [[ ! -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]]
+    [[ ! -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]] || fail 'on-demand Simulator still booted after lease expiry'
 
     CRASHED_LEASE="$("$LEASE_TOOL" acquire --owner crash-scaler --ttl 60 --boot-if-needed --json)"
-    [[ "$(jq -r '.bootedBySimLease' <<< "$CRASHED_LEASE")" == 'true' ]]
+    [[ "$(jq -r '.bootedBySimLease' <<< "$CRASHED_LEASE")" == 'true' ]] || fail 'crash lease did not boot a Simulator'
     CRASHED_GUARD="$("$LEASE_TOOL" status --json | jq -r --arg udid "$SCALING_BOOTED_UDID" '.devices[] | select(.udid == $udid) | .lease.guardPid')"
     kill -9 "$CRASHED_GUARD"
     sleep 1
     "$LEASE_TOOL" status --json >/dev/null
-    [[ ! -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]]
+    [[ ! -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]] || fail 'on-demand Simulator still booted after its guard crashed'
 
     SIMLEASE_TEST_FREE_MEMORY_PERCENT=5 \
         "$LEASE_TOOL" acquire --owner low-memory --ttl 30 --wait 1 --boot-if-needed --json \
-        > "${SCALING_ROOT}/low-memory.json" 2> "${SCALING_ROOT}/low-memory.err" && {
-            printf 'Low-memory acquisition unexpectedly booted a Simulator\n' >&2
-            exit 1
-        }
-    grep -q 'not enough free memory' "${SCALING_ROOT}/low-memory.err"
-    [[ ! -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]]
+        > "${SCALING_ROOT}/low-memory.json" 2> "${SCALING_ROOT}/low-memory.err" \
+        && fail 'low-memory acquisition unexpectedly booted a Simulator'
+    grep -q 'not enough free memory' "${SCALING_ROOT}/low-memory.err" || fail 'low-memory acquisition failed for the wrong reason'
+    [[ ! -f "${SCALING_STATE}/${SCALING_BOOTED_UDID}.booted" ]] || fail 'low-memory acquisition booted a Simulator'
 
     SIMLEASE_MAX_BOOTED_SIMULATORS=1 \
         "$LEASE_TOOL" acquire --owner capped-pool --ttl 30 --wait 1 --boot-if-needed --json \
-        > "${SCALING_ROOT}/capped.json" 2> "${SCALING_ROOT}/capped.err" && {
-            printf 'Pool-cap acquisition unexpectedly booted a Simulator\n' >&2
-            exit 1
-        }
-    grep -q 'safe booted Simulator limit' "${SCALING_ROOT}/capped.err"
+        > "${SCALING_ROOT}/capped.json" 2> "${SCALING_ROOT}/capped.err" \
+        && fail 'pool-cap acquisition unexpectedly booted a Simulator'
+    grep -q 'safe booted Simulator limit' "${SCALING_ROOT}/capped.err" || fail 'pool-cap acquisition failed for the wrong reason'
 
-    "$LEASE_TOOL" release --token "$BASE_TOKEN" --json | jq -e '.shutDown == false' >/dev/null
+    "$LEASE_TOOL" release --token "$BASE_TOKEN" --json | jq -e '.shutDown == false' >/dev/null || fail 'releasing the pool holder shut down a Simulator SimLease did not boot'
     BASE_TOKEN=''
 )
-
-cleanup() {
-    [[ -z "$TOKEN_A" ]] || "$LEASE_TOOL" release --token "$TOKEN_A" >/dev/null 2>&1 || true
-    [[ -z "$TOKEN_B" ]] || "$LEASE_TOOL" release --token "$TOKEN_B" >/dev/null 2>&1 || true
-    [[ -z "$TOKEN_C" ]] || "$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null 2>&1 || true
-    rm -rf "$TEST_ROOT"
-}
-trap cleanup EXIT
 
 CONCURRENT_LEASE_DIR="${TEST_ROOT}/concurrent-leases"
 SIMLEASE_DIR="$CONCURRENT_LEASE_DIR" \
@@ -144,10 +158,8 @@ STATUS_A=$?
 wait "$PID_B"
 STATUS_B=$?
 set -e
-[[ $(( (STATUS_A == 0 ? 1 : 0) + (STATUS_B == 0 ? 1 : 0) )) -eq 1 ]] || {
-    printf 'Expected exactly one winner for simultaneous acquisition, got statuses %s and %s\n' "$STATUS_A" "$STATUS_B" >&2
-    exit 1
-}
+[[ $(( (STATUS_A == 0 ? 1 : 0) + (STATUS_B == 0 ? 1 : 0) )) -eq 1 ]] \
+    || fail "expected exactly one winner for simultaneous acquisition, got statuses ${STATUS_A} and ${STATUS_B}"
 if [[ "$STATUS_A" -eq 0 ]]; then
     CONCURRENT_TOKEN="$(jq -r '.token' "${TEST_ROOT}/contender-a.json")"
 else
@@ -160,46 +172,44 @@ SIMLEASE_DEVICES=$'33333333-3333-3333-3333-333333333333\tiPhone Contention Test'
 LEASE_A="$("$LEASE_TOOL" acquire --owner agent-a --purpose 'first test' --ttl 30 --json)"
 TOKEN_A="$(jq -r '.token' <<<"$LEASE_A")"
 UDID_A="$(jq -r '.udid' <<<"$LEASE_A")"
-[[ -n "$TOKEN_A" && -n "$UDID_A" ]]
+[[ -n "$TOKEN_A" && -n "$UDID_A" ]] || fail 'agent-a lease is missing a token or UDID'
 
 LEASE_B="$("$LEASE_TOOL" acquire --owner agent-b --purpose 'second test' --ttl 30 --json)"
 TOKEN_B="$(jq -r '.token' <<<"$LEASE_B")"
 UDID_B="$(jq -r '.udid' <<<"$LEASE_B")"
-[[ "$UDID_A" != "$UDID_B" ]]
+[[ "$UDID_A" != "$UDID_B" ]] || fail 'agent-a and agent-b leased the same Simulator'
 
 if "$LEASE_TOOL" acquire --owner agent-overflow --ttl 30 --json >/dev/null 2>&1; then
-    printf 'Third agent unexpectedly acquired one of two leased simulators\n' >&2
-    exit 1
+    fail 'third agent unexpectedly acquired one of two leased Simulators'
 fi
 
 STATUS="$("$LEASE_TOOL" status --json)"
-[[ "$(jq '[.devices[] | select(.state == "leased")] | length' <<<"$STATUS")" == '2' ]]
-[[ "$(jq -r '.devices[] | select(.lease.owner == "agent-a") | .lease.purpose' <<<"$STATUS")" == 'first test' ]]
+[[ "$(jq '[.devices[] | select(.state == "leased")] | length' <<<"$STATUS")" == '2' ]] || fail 'status does not show two leased Simulators'
+[[ "$(jq -r '.devices[] | select(.lease.owner == "agent-a") | .lease.purpose' <<<"$STATUS")" == 'first test' ]] || fail 'status does not show the agent-a lease purpose'
 
 # shellcheck disable=SC2016 # Variables intentionally expand inside the leased child shell.
 EXEC_OUTPUT="$("$LEASE_TOOL" exec --token "$TOKEN_A" -- sh -c 'printf "%s|%s|%s" "$SIMULATOR_UDID" "$SIMULATOR_NAME" "$DERIVED_DATA_PATH"')"
-[[ "$EXEC_OUTPUT" == "$UDID_A|iPhone Test One|"* ]]
+[[ "$EXEC_OUTPUT" == "$UDID_A|iPhone Test One|"* ]] || fail 'exec did not export the leased Simulator environment'
 
 OLD_EXPIRY="$(jq -r --arg owner agent-a '.devices[] | select(.lease.owner == $owner) | .lease.expiresAtEpoch' <<<"$("$LEASE_TOOL" status --json)")"
 sleep 1
 NEW_EXPIRY="$("$LEASE_TOOL" renew --token "$TOKEN_A" --ttl 60 --json | jq -r '.expiresAtEpoch')"
-[[ "$NEW_EXPIRY" -gt "$OLD_EXPIRY" ]]
+[[ "$NEW_EXPIRY" -gt "$OLD_EXPIRY" ]] || fail 'renew did not extend the lease expiry'
 
 if "$LEASE_TOOL" release --token not-a-real-token >/dev/null 2>&1; then
-    printf 'Invalid token unexpectedly released a simulator\n' >&2
-    exit 1
+    fail 'invalid token unexpectedly released a Simulator'
 fi
 
 "$LEASE_TOOL" release --token "$TOKEN_A" >/dev/null
 TOKEN_A=""
 LEASE_C="$("$LEASE_TOOL" acquire --owner agent-c --purpose 'replacement test' --ttl 2 --json)"
 TOKEN_C="$(jq -r '.token' <<<"$LEASE_C")"
-[[ "$(jq -r '.udid' <<<"$LEASE_C")" == "$UDID_A" ]]
+[[ "$(jq -r '.udid' <<<"$LEASE_C")" == "$UDID_A" ]] || fail 'agent-c did not reuse the released Simulator'
 
 sleep 3
 TOKEN_C=""
 STATUS_AFTER_EXPIRY="$("$LEASE_TOOL" status --json)"
-[[ "$(jq -r --arg udid "$UDID_A" '.devices[] | select(.udid == $udid) | .state' <<<"$STATUS_AFTER_EXPIRY")" == 'free' ]]
+[[ "$(jq -r --arg udid "$UDID_A" '.devices[] | select(.udid == $udid) | .state' <<<"$STATUS_AFTER_EXPIRY")" == 'free' ]] || fail 'expired lease did not free its Simulator'
 
 "$LEASE_TOOL" release --token "$TOKEN_B" >/dev/null
 TOKEN_B=""
@@ -210,12 +220,12 @@ jq -n \
     '{pid:$pid,device:$device,url:"http://127.0.0.1:3999"}' \
     > "${SIMLEASE_SERVE_SIM_STATE_DIR}/server-${UDID_A}.json"
 SERVE_SIM_STATUS="$("$LEASE_TOOL" status --json)"
-[[ "$(jq -r --arg udid "$UDID_A" '.devices[] | select(.udid == $udid) | .state' <<<"$SERVE_SIM_STATUS")" == 'free' ]]
-[[ "$(jq -r --arg udid "$UDID_A" '.devices[] | select(.udid == $udid) | .serveSimActive' <<<"$SERVE_SIM_STATUS")" == 'true' ]]
+[[ "$(jq -r --arg udid "$UDID_A" '.devices[] | select(.udid == $udid) | .state' <<<"$SERVE_SIM_STATUS")" == 'free' ]] || fail 'Simulator with an idle serve-sim helper is not free'
+[[ "$(jq -r --arg udid "$UDID_A" '.devices[] | select(.udid == $udid) | .serveSimActive' <<<"$SERVE_SIM_STATUS")" == 'true' ]] || fail 'status does not report the active serve-sim helper'
 LEASE_C="$("$LEASE_TOOL" acquire --owner existing-helper-reuser --device "$UDID_A" --boot-if-needed --ttl 30 --json)"
 TOKEN_C="$(jq -r '.token' <<<"$LEASE_C")"
-[[ "$(jq -r '.bootedBySimLease' <<<"$LEASE_C")" == 'false' ]]
-[[ "$(jq -r '.serveSimAlreadyRunning' <<<"$LEASE_C")" == 'true' ]]
+[[ "$(jq -r '.bootedBySimLease' <<<"$LEASE_C")" == 'false' ]] || fail 'reusing a running serve-sim helper booted the Simulator again'
+[[ "$(jq -r '.serveSimAlreadyRunning' <<<"$LEASE_C")" == 'true' ]] || fail 'acquire did not report the running serve-sim helper'
 "$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null
 TOKEN_C=""
 # The v0.2.0 migration flag remains accepted for script compatibility.
@@ -231,7 +241,7 @@ GUARD_PID="$("$LEASE_TOOL" status --json | jq -r --arg udid "$UDID_A" '.devices[
 kill -9 "$GUARD_PID"
 sleep 1
 STALE_STATUS="$("$LEASE_TOOL" status --json)"
-[[ "$(jq -r --arg udid "$UDID_A" '.devices[] | select(.udid == $udid) | .state' <<<"$STALE_STATUS")" == 'free' ]]
+[[ "$(jq -r --arg udid "$UDID_A" '.devices[] | select(.udid == $udid) | .state' <<<"$STALE_STATUS")" == 'free' ]] || fail 'killing the lease guard did not free the Simulator'
 TOKEN_C=""
 
 printf 'simulator lease tests passed\n'

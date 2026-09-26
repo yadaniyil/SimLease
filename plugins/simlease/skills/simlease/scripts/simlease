@@ -185,6 +185,7 @@ boot_device() {
     local udid="$1"
     if [[ -n "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]]; then
         mkdir -p "$SIMLEASE_TEST_DEVICE_STATE_DIR"
+        sleep "${SIMLEASE_TEST_BOOT_DELAY_SECONDS:-0}"
         : > "${SIMLEASE_TEST_DEVICE_STATE_DIR}/${udid}.booted"
         return 0
     fi
@@ -446,7 +447,7 @@ guard_lease() {
     local ready_file="${HANDSHAKE_DIR}/${hashed_token}.ready"
     local acknowledged_file="${HANDSHAKE_DIR}/${hashed_token}.ack"
     local release_file="${SIGNAL_DIR}/${hashed_token}.release"
-    local acknowledgement_deadline=$(( $(date +%s) + 5 ))
+    local acknowledgement_deadline
     local current_expiry
 
     metadata="$(metadata_path_for_udid "$udid")"
@@ -469,6 +470,9 @@ guard_lease() {
         jq '.lifecycleState = "leased"' "$metadata" > "${metadata}.booted.$$"
         mv "${metadata}.booted.$$" "$metadata"
     fi
+    # Start the handshake clock only after booting; a Simulator boot can take
+    # far longer than the acknowledgement window.
+    acknowledgement_deadline=$(( $(date +%s) + 5 ))
     : > "$ready_file"
 
     while [[ ! -f "$acknowledged_file" ]]; do
@@ -548,6 +552,7 @@ try_acquire_device() {
     )
     if [[ -n "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]]; then
         guard_environment+=("SIMLEASE_TEST_DEVICE_STATE_DIR=${SIMLEASE_TEST_DEVICE_STATE_DIR}")
+        guard_environment+=("SIMLEASE_TEST_BOOT_DELAY_SECONDS=${SIMLEASE_TEST_BOOT_DELAY_SECONDS:-0}")
     fi
 
     if ! launchctl submit -l "$guard_label" -o /dev/null -e /dev/null -- \
