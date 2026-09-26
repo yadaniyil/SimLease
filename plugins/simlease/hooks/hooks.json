@@ -1,5 +1,5 @@
 {
-  "description": "Keep Codex Simulator operations inside an active SimLease lease.",
+  "description": "Keep Simulator and emulator operations inside an active SimLease lease.",
   "hooks": {
     "PreToolUse": [
       {

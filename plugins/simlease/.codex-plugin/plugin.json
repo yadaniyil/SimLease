@@ -1,7 +1,7 @@
 {
   "name": "simlease",
   "version": "0.3.0",
-  "description": "Stop coding agents from fighting over the same iOS Simulator.",
+  "description": "Stop coding agents from fighting over the same iOS Simulator or Android emulator.",
   "author": {
     "name": "Danny Yako",
     "url": "https://github.com/yadaniyil"
@@ -12,6 +12,8 @@
   "keywords": [
     "ios",
     "simulator",
+    "android",
+    "emulator",
     "xcode",
     "concurrency",
     "agents"
@@ -19,8 +21,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "SimLease",
-    "shortDescription": "Stop coding agents fighting over one Simulator",
-    "longDescription": "Use several coding agents on one Mac without Simulator conflicts. SimLease gives each task its own iOS Simulator, so builds, tests, and app previews don't interrupt each other.",
+    "shortDescription": "Stop coding agents fighting over one device",
+    "longDescription": "Use several coding agents on one Mac without device conflicts. SimLease gives each task its own iOS Simulator or Android emulator and slims Simulators with simslim, so builds, tests, and app previews don't interrupt each other.",
     "developerName": "Danny Yako",
     "category": "Developer Tools",
     "capabilities": [
@@ -30,8 +32,8 @@
     ],
     "defaultPrompt": [
       "Use SimLease before running this work on an iOS Simulator.",
-      "Show which booted iOS Simulators are currently available.",
-      "Run my iOS tests on an exclusively leased Simulator."
+      "Run my Android app on its own leased emulator.",
+      "Show which Simulators and emulators are leased right now."
     ],
     "brandColor": "#0A84FF",
     "websiteURL": "https://github.com/yadaniyil/SimLease",

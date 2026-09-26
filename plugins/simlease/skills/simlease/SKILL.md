@@ -1,70 +1,75 @@
 ---
 name: simlease
-description: Automatically coordinate iOS Simulator access for every iOS or iPadOS task that builds, tests, installs, launches, screenshots, interacts with, changes, boots, or shuts down a Simulator. Always use before xcodebuild Simulator destinations, xcrun simctl, XcodeBuildMCP Simulator tools, or serve-sim, even when the user does not mention SimLease.
+description: Automatically coordinate iOS Simulator and Android emulator access for every mobile task that builds, tests, installs, launches, screenshots, interacts with, changes, boots, or shuts down a Simulator or emulator. Always use before xcodebuild Simulator destinations, xcrun simctl, XcodeBuildMCP Simulator tools, serve-sim, flutter run on a Simulator or emulator, emulator boots, or adb commands aimed at an emulator, even when the user does not mention SimLease.
 ---
 
 # SimLease
 
-Use the bundled `scripts/simlease` executable as the source of truth. Resolve both scripts relative to the directory containing this `SKILL.md`; do not assume `simlease` is already on `PATH`.
+Use the bundled `scripts/simlease` executable, resolved relative to the directory containing this `SKILL.md`. If `simlease` on `PATH` reports a newer version (`simlease --version`), use that one instead, so every agent on the Mac runs the same version.
 
 ## Preflight
 
-Before the first simulator operation in a task, run `scripts/preflight`. If it fails, report the missing dependency and continue only with work that does not touch a simulator.
+Before the first device operation in a task, run `scripts/preflight`. If it fails, report the missing dependency and continue only with work that does not touch a device.
 
-## Lease workflow
+## iOS Simulator workflow
 
-1. Inspect ownership with `scripts/simlease status --json` when existing simulator activity is possible.
-   A device with `state: "free"` remains available when `serveSimActive` is true. An existing `serve-sim` helper is reusable infrastructure, not a lease or ownership claim.
-2. Acquire before touching a simulator:
+1. Inspect ownership with `scripts/simlease status --json` when other device activity is possible.
+   A device with `state: "free"` stays available when `serveSimActive` is true. An existing `serve-sim` helper is reusable infrastructure, not a lease or ownership claim.
+2. Acquire before touching a Simulator. Save the token to a file in your scratch folder:
 
    ```bash
    scripts/simlease acquire \
      --owner '<task-or-agent-name>' \
      --purpose '<short purpose>' \
-     --ttl 3600 \
-     --wait 120 \
+     --wait 900 \
      --boot-if-needed \
+     --token-file '<scratch>/sim.token' \
      --json
    ```
 
-   Tell the user `🔒 Reserving an iOS Simulator for this task…` before acquisition. If acquisition waits, say `⏳ All matching Simulators are busy. I’m waiting for one to become free.`
-
-3. Retain the returned `token`, `udid`, and `derivedDataPath` for the current task. Treat the token as a secret and never commit or persist it in the project.
-4. Use only the leased UDID. Never select `booted`, a device name, or automatic simulator discovery after acquisition.
-5. Run shell operations through the lease when possible:
+   Before acquiring, tell the user `🔒 Reserving an iOS Simulator for this task…`. If acquisition waits, say `⏳ All matching Simulators are busy. I'm waiting for one to become free.`
+   Never pipe the acquire output through `tail` or `head`: a lost token blocks the device until the lease expires.
+3. SimLease slims the Simulator with the shared simslim profile. If the app needs services the profile turns off (widgets, speech, contacts, HealthKit), add `--keep-services <categories>` to acquire. Never run `simslim on` or `off` yourself.
+4. Use only the leased UDID. Never select `booted`, a device name, or automatic Simulator discovery.
+5. Run commands through the lease. Put lease variables inside single-quoted `sh -c '…'`, so the lease sets them, not the calling shell:
 
    ```bash
-   scripts/simlease exec --token '<token>' -- \
-     xcodebuild -scheme App \
-       -destination 'id=<udid>' \
-       -derivedDataPath '<derivedDataPath>' \
-       test
+   scripts/simlease exec --token-file '<scratch>/sim.token' -- sh -c '
+     xcodebuild -scheme App -destination "id=$SIMULATOR_UDID" -derivedDataPath "$DERIVED_DATA_PATH" test
+   '
    ```
 
-6. `exec` renews the lease for as long as its command runs. Renew by hand only for work outside `exec`: `scripts/simlease renew --token '<token>' --ttl 3600`. Pass `--token-file <path>` to acquire, renew, release and exec to keep the token out of truncated command output.
-7. Release in cleanup, including after failures: `scripts/simlease release --token '<token>'`.
+6. `exec` keeps the lease alive while its command runs. For work outside `exec`, renew by hand: `scripts/simlease renew --token-file '<scratch>/sim.token' --ttl 3600`.
+7. Release in cleanup, including after failures: `scripts/simlease release --token-file '<scratch>/sim.token'`.
 
-After acquisition, tell the user which named Simulator is reserved. If `bootedBySimLease` is true, also say `🚀 Started <device> because every running Simulator was busy.` After cleanup, confirm that it was released; if release reports `shutDown: true`, say `💤 Shut down <device> to release its RAM.` Do not expose the lease token in commentary or the final response.
+After acquisition, tell the user which named Simulator is reserved. If `bootedBySimLease` is true, also say `🚀 Started <device> because every running Simulator was busy.` After cleanup, confirm that it was released. If release reports `shutDown: true`, say `💤 Shut down <device> to release its RAM.` Never expose the lease token in commentary or the final response.
 
-## Slimming and Android
+## Android emulator workflow
 
-- Every leased Simulator is slimmed with simslim against the shared profile. Never run `simslim on`/`off` yourself; ask for extra services with `--keep-services <categories>` on acquire.
-- Android emulators: `scripts/simlease acquire --avd <AVD> --owner <task> --wait 600 --token-file <file> --json`, then `scripts/simlease exec --token-file <file> -- adb ...` or `-- sh -c 'flutter run -d "$ANDROID_SERIAL"'` (single quotes: the lease sets the variable, not the calling shell). Never boot an emulator or aim `adb` at one outside a lease.
+1. Acquire: `scripts/simlease acquire --avd '<AVD>' --owner '<task>' --wait 900 --token-file '<scratch>/emu.token' --json`. This boots your own read-only instance of the AVD on a free port. List AVDs with `emulator -list-avds`.
+2. Run commands through the lease:
+   - `scripts/simlease exec --token-file '<scratch>/emu.token' -- adb …` (adb reads `ANDROID_SERIAL`)
+   - `-- sh -c 'flutter run -d "$ANDROID_SERIAL"'`
+   - The gRPC port is `$ANDROID_EMULATOR_GRPC_PORT`.
+3. Use `--writable` only when the task must change the AVD itself. Pass extra emulator flags with `--emulator-args "…"`.
+4. Release when done. Release stops the emulator.
+
+Never boot an emulator, or aim `adb` or `flutter` at one, outside a lease. Physical Android devices are not leased: address them with `adb -s <serial>`.
 
 ## Tool-specific rules
 
-- For XcodeBuildMCP, set `simulatorId` to the leased UDID before every simulator tool call. Use the returned `derivedDataPath` for builds when the tool supports it.
-- For `serve-sim`, use only the leased UDID. Reuse an existing helper when `serveSimAlreadyRunning` is true and leave that inherited helper running during cleanup. Otherwise start one for that UDID and stop only the helper started by the current task. Never stop a helper while another lease owns its simulator.
-- For direct `xcrun simctl`, pass the exact leased UDID.
-- Do not run simulator-global destructive commands while another lease may exist.
-- If all matching simulators are leased, wait or continue non-simulator work. Never take over another lease.
-- With `--boot-if-needed`, SimLease measures memory pressure and the safe booted-device cap. It starts one shutdown Simulator only when both checks pass. Otherwise, explain that it is waiting for an existing lease.
+- For XcodeBuildMCP, set `simulatorId` to the leased UDID before every Simulator tool call. Use the returned `derivedDataPath` for builds when the tool supports it.
+- For `serve-sim`, use only the leased UDID. Reuse an existing helper when `serveSimAlreadyRunning` is true, and leave that inherited helper running during cleanup. Otherwise start one for that UDID, and stop only the helper started by the current task. Never stop a helper while another lease owns its Simulator.
+- Pinned Simulators (`~/.config/simlease/pinned`) hold a sign-in or seeded media. Lease one only with `--device <UDID>`, and only when the task needs that state.
+- Never run commands that hit every device, even inside a lease: `simctl … all`, `simctl … booted`, `killall Simulator`, `killall qemu-system…`, a `pkill` that doesn't name your port or serial, or `adb kill-server`.
+- If all matching devices are leased, wait or continue other work. Never take over another lease.
+- With `--boot-if-needed`, SimLease checks memory pressure and the booted-device cap before it starts a shutdown Simulator. If either check fails, explain that it is waiting for an existing lease.
 - SimLease shuts down only a Simulator that it started for the current lease. Never manually shut down a Simulator that was already running.
-- A previously started Simulator or `serve-sim` helper is eligible for normal acquisition. Prefer leasing an already booted free device before allowing `--boot-if-needed` to start another one.
+- Devices keep other projects' apps and data. Install your own build, and never wipe data you did not create.
 
 ## Failure handling
 
-- If acquisition fails, inspect `status`; do not bypass SimLease.
+- If acquisition fails, inspect `status`. Do not bypass SimLease.
 - If a command fails, release the lease before reporting completion.
-- If the agent loses the token, wait for expiry or ask the user before interfering with the guard process.
-- Remember that SimLease coordinates cooperating clients; it cannot stop software that bypasses it.
+- If you lose the token, wait for the lease to expire, or ask the user, before interfering with the guard process.
+- SimLease coordinates cooperating clients. It cannot stop software that bypasses it.

@@ -19,5 +19,6 @@ jobs:
         run: |
           ./tests/plugin-tests.py
           ./tests/hook-tests.py
+          ./tests/claude-hook-tests.py
       - name: Test lease engine
         run: ./tests/simlease-tests.sh
