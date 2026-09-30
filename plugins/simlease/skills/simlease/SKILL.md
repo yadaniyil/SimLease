@@ -9,7 +9,7 @@ Use the bundled `scripts/simlease` executable, resolved relative to the director
 
 ## Preflight
 
-Before the first device operation in a task, run `scripts/preflight`. If it fails, report the missing dependency and continue only with work that does not touch a device.
+Before the first device operation in a task, run `scripts/preflight`. If it fails, report the missing dependency and continue only with work that does not touch a device. If it warns that simslim is too old, tell the user; leasing still works.
 
 ## iOS Simulator workflow
 
@@ -29,7 +29,7 @@ Before the first device operation in a task, run `scripts/preflight`. If it fail
 
    Before acquiring, tell the user `🔒 Reserving an iOS Simulator for this task…`. If acquisition waits, say `⏳ All matching Simulators are busy. I'm waiting for one to become free.`
    Never pipe the acquire output through `tail` or `head`: a lost token blocks the device until the lease expires.
-3. SimLease slims the Simulator with the shared simslim profile. If the app needs services the profile turns off (widgets, speech, contacts, HealthKit), add `--keep-services <categories>` to acquire. Never run `simslim on` or `off` yourself.
+3. SimLease slims the Simulator with the shared simslim profile. If the app needs services the profile turns off (widgets, speech, contacts, HealthKit), add `--keep-services <categories>` to acquire. Never run simslim commands that change a device (`on`, `off`, `watch`, `clone`, `repair-clone`, `erase`, `delete`, `disk-clean`, `boot`, `shutdown`, `rename`). Read-only ones are fine (`list`, `profiles`, `status`, `verify`, `doctor`, `measure`, `size`, `top --json`, `disk-plan`). To check features, run `scripts/simlease exec --token-file '<scratch>/sim.token' -- sh -c 'simslim doctor "$SIMULATOR_UDID" --requires <features>'`.
 4. Use only the leased UDID. Never select `booted`, a device name, or automatic Simulator discovery.
 5. Run commands through the lease. Put lease variables inside single-quoted `sh -c '…'`, so the lease sets them, not the calling shell:
 

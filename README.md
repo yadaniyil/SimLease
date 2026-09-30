@@ -17,7 +17,7 @@ Run several coding agents on one Mac: Claude Code, Codex, or anything that can r
 SimLease is one Bash CLI plus an optional guard hook. It uses macOS `lockf` kernel locks as the source of truth, keeps human-readable JSON lease metadata, and needs no database, daemon or MCP server.
 
 - **iOS Simulators.** Every lease gets one Simulator to itself, with its own Derived Data path. Busy pool? SimLease boots another Simulator when memory allows.
-- **Slim Simulators.** With [simslim](https://github.com/mobai-app/simslim) installed, every leased Simulator is trimmed to the services apps need: about 0.4 GB instead of 4 GB, so twice as many fit.
+- **Slim Simulators.** With [simslim](https://github.com/mobai-app/simslim) installed, every leased Simulator is trimmed to the services apps need: about 0.9 GB instead of 4 GB, so twice as many fit.
 - **Android emulators.** Every lease boots its own instance of an AVD on a free port. Instances run read-only by default, so many agents can share one AVD without changing it.
 - **Guard hooks.** Claude Code and Codex hooks block device commands that don't hold a lease, and commands that would hit every agent's devices at once.
 
@@ -48,7 +48,7 @@ cd SimLease
 
 The installer runs a dependency preflight and installs `~/.local/bin/simlease` and the guard at `~/.local/share/simlease/hooks/`. It also creates `~/.config/simlease/simslim-profile.json` and `~/.config/simlease/pinned` if they don't exist; it never overwrites them. Choose another prefix with `--prefix /usr/local`.
 
-Optional: `brew install mobai-app/tap/simslim` to slim every leased Simulator.
+Optional: `brew install mobai-app/tap/simslim` to slim every leased Simulator. SimLease needs simslim 0.6.1 or newer; 0.11 is recommended (much faster slimming).
 
 ### Claude Code
 
@@ -183,13 +183,20 @@ When `simslim` is on `PATH`, every iOS acquire makes the leased Simulator match 
 
 `except` lists the [simslim categories](https://github.com/mobai-app/simslim) that stay running; `keep` lists single daemons that stay running. The default keeps what most apps need: the photo library, StoreKit and push, Apple sign-in and keychain, and universal links and web sign-in.
 
-- **Timing.** A Simulator that already matches costs a one-second check. Any other is reconfigured and rebooted slim once, in 10-25 s.
+- **Timing.** A Simulator that already matches costs a one-second check. Any other is reconfigured and rebooted slim once, in 10-25 s with simslim 0.11 or newer. Older versions take longer.
 - **Why one profile.** Slimming persists on the device. A Simulator slimmed for one project must still run the next project's app, so every project shares the same profile.
-- **Extra services.** A lease that needs more, such as widgets or speech, asks for them with `--keep-services widgets,siri`. The device is re-slimmed for that lease and back to the shared profile for the next lease that doesn't ask.
+- **Extra services.** A lease that needs more, such as widgets or speech, asks for them with `--keep-services widgets,siri`. The device is re-slimmed for that lease and back to the shared profile for the next lease that doesn't ask. An unknown category fails the acquire before it takes a device; `simslim profiles` lists the categories.
+- **Result.** `acquire` reports `slim`: `verified` (already matched), `applied`, `failed`, `unsupported` (simslim older than 0.6.1), or `off`. After `failed` the lease still holds, the Simulator keeps its previous profile, and SimLease boots it again if simslim left it shut down.
 - **Pool size.** Slim Simulators raise the pool cap: 2 booted Simulators below 16 GB of RAM, 3 below 32 GB, 4 below 64 GB, and 6 at 64 GB (without simslim: 1, 2 and 3).
 - **Off switch.** `SIMLEASE_SLIM=0` turns slimming off.
 
-Agents should never run `simslim on` or `off` themselves; the guard blocks it.
+Agents never run simslim commands that change a device: `on`, `off`, `watch`, `clone`, `repair-clone`, `erase`, `delete`, `disk-clean`, `boot`, `shutdown` and `rename`. The guard blocks them. Read-only ones are fine: `list`, `profiles`, `status`, `verify`, `doctor`, `measure`, `size`, `top --json` and `disk-plan`. To check that a leased Simulator still has the features an app needs, run `simslim doctor` inside the lease:
+
+```bash
+simlease exec --token-file /tmp/agent-one.sim -- sh -c 'simslim doctor "$SIMULATOR_UDID" --requires push,storekit'
+```
+
+`simslim doctor --list` lists the features.
 
 ## Android emulators
 
@@ -220,13 +227,15 @@ The guard is a `PreToolUse` hook shared by Claude Code and Codex. It reads each 
 
 **Always blocked, even inside a lease.** These hit every agent's devices:
 - `simctl … all` and `simctl … booted`
-- `simslim on`/`off`
+- simslim commands that change a device: `on`, `off`, `watch`, `clone`, `repair-clone`, `erase`, `delete`, `disk-clean`, `boot`, `shutdown`, `rename`. Global options before the command, a full path, quotes and `$(which simslim)` don't get past it. `watch` slims every Simulator as it boots, other agents' too; `repair-clone` can keep another agent's Simulator shut down.
 - `killall` of Simulators or emulators
 - a `pkill` that doesn't name a port or serial
 - `adb kill-server`
 
 **Always allowed:**
 - read-only calls such as `xcrun simctl list`, `adb devices` and `emulator -list-avds`
+- read-only simslim commands: `list`, `profiles`, `status`, `verify`, `doctor`, `measure`, `size`, `top`, `disk-plan`, `disk-categories`, `version`, `profile`
+- text searches (`grep`, `rg`, `ag`, `git grep`) that mention device commands. A device command elsewhere in the same command line is still checked.
 - physical devices addressed with `adb -s <serial>`
 
 The guard only sees command text. A script that runs `simctl` inside it passes unchecked, and a commit message that mentions a blocked command gets blocked; use `git commit -F <file>` for those.
@@ -243,7 +252,11 @@ Many agents share this Mac's devices. `simlease` leases every Simulator and emul
   Run everything inside the lease, in single quotes:
   `simlease exec --token-file <scratch>/sim.token -- sh -c 'flutter run -d "$SIMULATOR_UDID"'`.
   Never use `booted` or a hard-coded UDID. Need more services? Add `--keep-services widgets,siri`.
-  Never run `simslim on/off` yourself: simlease slims every leased Simulator.
+  simlease slims every leased Simulator. Never run simslim commands that change a device (`on`, `off`,
+  `watch`, `clone`, `repair-clone`, `erase`, `delete`, `disk-clean`, `boot`, `shutdown`, `rename`).
+  Read-only ones are fine (`list`, `profiles`, `status`, `verify`, `doctor`, `measure`, `size`,
+  `top --json`, `disk-plan`). To check features, run `simslim doctor "$SIMULATOR_UDID" --requires <features>`
+  inside `simlease exec`.
 - Android: `simlease acquire --avd <AVD> --owner <task> --wait 900 --token-file <scratch>/emu.token --json`
   boots your own read-only instance. Then `simlease exec --token-file … -- adb …` or
   `-- sh -c 'flutter run -d "$ANDROID_SERIAL"'`.
@@ -292,13 +305,15 @@ A previously started `serve-sim` helper doesn't reserve its Simulator. `status` 
 - Bash, `jq`, `python3` (for the hooks)
 - `install`, `launchctl`, `lockf`, `shasum` and `uuidgen`, which ship with macOS
 - For Android: the Android SDK emulator and platform tools, and at least one AVD
-- Optional: [simslim](https://github.com/mobai-app/simslim) for slim Simulators
+- Optional: [simslim](https://github.com/mobai-app/simslim) 0.6.1 or newer for slim Simulators; 0.11 recommended (much faster slimming)
 
 Check a machine without taking a lease:
 
 ```bash
 ./plugins/simlease/skills/simlease/scripts/preflight
 ```
+
+The preflight also prints the simslim version. It warns below 0.11, and below 0.6.1 it says SimLease won't slim Simulators. Leasing works either way.
 
 ## Limitations
 
@@ -319,7 +334,7 @@ shellcheck bin/simlease scripts/install.sh plugins/simlease/skills/simlease/scri
 ./tests/simlease-tests.sh
 ```
 
-The lease tests use fake Simulators, fake emulators and a fake simslim in a temporary lease directory. They never touch real devices. GitHub Actions runs the same checks on macOS. A tag matching the manifest version, such as `v0.3.0`, publishes a GitHub release with the plugin archive, the standalone CLI and SHA-256 checksums.
+The lease tests use fake Simulators, fake emulators and a fake simslim in a temporary lease directory. They never touch real devices. GitHub Actions runs the same checks on macOS. A tag matching the manifest version, such as `v0.3.1`, publishes a GitHub release with the plugin archive, the standalone CLI and SHA-256 checksums.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 

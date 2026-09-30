@@ -7,8 +7,9 @@ hook JSON format), which decides for Bash commands and Simulator tools, and adds
 - `flutter run|drive|test|install|attach|logs|screenshot` aimed at an iOS
   Simulator UDID (8-4-4-4-12 hex) must run through `simlease exec --token ...`.
   Physical iPhone UDIDs pass.
-- Read-only `xcrun simctl list|help` is allowed without a lease.
 - Tools other than Bash and Simulator tools (TaskStop reaches this hook) pass.
+The upstream guard allows read-only `xcrun simctl list|help` itself. This
+wrapper hides those calls too, for an older upstream guard (SimLease 0.3.0).
 """
 
 from __future__ import annotations
@@ -77,7 +78,7 @@ def main() -> int:
         if not SIMLEASE_EXEC.search(command) and FLUTTER_ON_SIMULATOR.search(command):
             emit("deny", FLUTTER_REASON)
             return 0
-        # Hide read-only simctl calls from the upstream guard, which blocks every simctl.
+        # The upstream guard allows read-only simctl calls since 0.3.1; older ones block every simctl.
         stripped = READ_ONLY_SIMCTL.sub("simctl-read-only", command)
         event = {**event, "tool_input": {**tool_input, "command": stripped}}
     elif not SIMULATOR_TOOL.search(tool_name):

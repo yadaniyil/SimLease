@@ -25,4 +25,8 @@ if ! xcrun simctl list devices -j >/dev/null 2>&1; then
     exit 1
 fi
 
+# simslim is optional: this prints its version and warns when it is too old,
+# but never fails the preflight.
+"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/simlease" __simslim-check || true
+
 printf 'SimLease preflight passed: Simulator control, locking, and memory-pressure checks are available.\n'

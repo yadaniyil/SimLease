@@ -27,7 +27,12 @@ ANDROID_SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-${HOME}/Library/Android/sdk}}"
 ANDROID_FIRST_PORT="${SIMLEASE_ANDROID_FIRST_PORT:-5560}"
 ANDROID_LAST_PORT="${SIMLEASE_ANDROID_LAST_PORT:-5680}"
 ANDROID_BOOT_TIMEOUT_SECONDS="${SIMLEASE_ANDROID_BOOT_TIMEOUT_SECONDS:-420}"
-SIMLEASE_VERSION="0.3.0"
+SIMLEASE_VERSION="0.3.1"
+# simslim 0.6.0 added `verify` (older versions re-slim on every lease), and
+# 0.6.1 keeps StoreKit working with `--except store`. 0.11 re-slims a booted
+# Simulator in about 17 s.
+SIMSLIM_MIN_VERSION="0.6.1"
+SIMSLIM_FAST_VERSION="0.11.0"
 
 usage() {
     cat <<'EOF'
@@ -68,7 +73,8 @@ Emulator options:
   --window           Show the emulator window (default headless).
   --emulator-args A  Extra emulator flags, e.g. "-camera-back emulated -gpu swiftshader_indirect".
 
-Every leased Simulator is slimmed with simslim. The shared profile is
+Every leased Simulator is slimmed with simslim (0.6.1 or newer; 0.11 is much
+faster). `scripts/preflight` checks the version. The shared profile is
 ~/.config/simlease/simslim-profile.json ({"except": [...], "keep": [...]}; default
 except: photos,store,icloud,web). SIMLEASE_SLIM=0 turns slimming off.
 ~/.config/simlease/pinned lists Simulator UDIDs automatic picks skip.
@@ -374,7 +380,7 @@ max_booted_simulators() {
     if [[ -n "${SIMLEASE_MAX_BOOTED_SIMULATORS:-}" ]]; then
         printf '%s\n' "$SIMLEASE_MAX_BOOTED_SIMULATORS"
     elif slimming_enabled; then
-        # Every leased Simulator is slimmed: ~0.4-1 GB instead of ~4 GB.
+        # Every leased Simulator is slimmed: about 0.9 GB instead of about 4 GB stock.
         if [[ "$total_mb" -lt 16384 ]]; then printf '2\n'
         elif [[ "$total_mb" -lt 32768 ]]; then printf '3\n'
         elif [[ "$total_mb" -lt 65536 ]]; then printf '4\n'
@@ -412,8 +418,58 @@ simslim_binary() {
     command -v simslim
 }
 
+# Prints simslim's version, such as 0.11.0, or nothing when it can't be read.
+simslim_version() {
+    "$1" version 2>/dev/null | awk 'match($0, /[0-9]+\.[0-9]+(\.[0-9]+)?/) { print substr($0, RSTART, RLENGTH); exit }' || true
+}
+
+# True when version $1 is $2 or newer.
+version_at_least() {
+    awk -v have="$1" -v want="$2" 'BEGIN {
+        split(have, h, "."); split(want, w, ".")
+        for (i = 1; i <= 3; i++) if (h[i] + 0 != w[i] + 0) exit (h[i] + 0 < w[i] + 0)
+        exit 0
+    }'
+}
+
+# False for a simslim older than SIMSLIM_MIN_VERSION. A version that can't be
+# read counts as new enough. `simslim version` takes a few milliseconds.
+simslim_is_supported() {
+    local version
+    version="$(simslim_version "$1")"
+    [[ -z "$version" ]] || version_at_least "$version" "$SIMSLIM_MIN_VERSION"
+}
+
 slimming_enabled() {
-    simslim_binary >/dev/null 2>&1
+    local simslim_bin
+    simslim_bin="$(simslim_binary 2>/dev/null)" || return 1
+    simslim_is_supported "$simslim_bin"
+}
+
+# Preflight's simslim check: prints the version and warns when it is old.
+# It never fails, because slimming is optional.
+check_simslim() {
+    local simslim_bin
+    local version
+    if [[ "${SIMLEASE_SLIM:-1}" == "0" ]]; then
+        printf 'simslim: slimming is off (SIMLEASE_SLIM=0)\n'
+        return 0
+    fi
+    if ! simslim_bin="$(simslim_binary 2>/dev/null)"; then
+        printf 'simslim: not installed, so leased Simulators run stock. Optional: brew install mobai-app/tap/simslim\n'
+        return 0
+    fi
+    version="$(simslim_version "$simslim_bin")"
+    if [[ -z "$version" ]]; then
+        printf 'simslim: could not read the version of %s\n' "$simslim_bin" >&2
+    elif ! version_at_least "$version" "$SIMSLIM_MIN_VERSION"; then
+        printf 'simslim %s is unsupported: SimLease needs %s or newer, so it will not slim Simulators. Run: brew upgrade simslim\n' \
+            "$version" "$SIMSLIM_MIN_VERSION" >&2
+    elif ! version_at_least "$version" "$SIMSLIM_FAST_VERSION"; then
+        printf 'simslim %s works, but 0.11 or newer slims much faster. Run: brew upgrade simslim\n' "$version" >&2
+    else
+        printf 'simslim %s\n' "$version"
+    fi
 }
 
 # The service categories a lease keeps running: the shared profile's "except"
@@ -423,21 +479,55 @@ kept_services() {
     if [[ -f "$SIMSLIM_PROFILE" ]]; then
         base="$(jq -r '(.except // []) | join(",")' "$SIMSLIM_PROFILE" 2>/dev/null || printf '%s' "$DEFAULT_SIMSLIM_EXCEPT")"
     fi
-    printf '%s,%s\n' "$base" "${SIMLEASE_KEEP_SERVICES:-}" | tr ',' '\n' | awk 'NF && !seen[$0]++' | paste -sd ',' -
+    printf '%s,%s\n' "$base" "${SIMLEASE_KEEP_SERVICES:-}" | tr ',' '\n' \
+        | awk '{ gsub(/[[:space:]]/, "") } NF && !seen[$0]++' | paste -sd ',' -
+}
+
+# Fails before leasing when --keep-services names a category simslim doesn't know.
+check_keep_services() {
+    local wanted="${SIMLEASE_KEEP_SERVICES:-}"
+    local simslim_bin
+    local category
+    local -a categories
+
+    wanted="${wanted//[[:space:]]/}"
+    [[ -n "${wanted//,/}" ]] || return 0
+    slimming_enabled || return 0
+    simslim_bin="$(simslim_binary)"
+    IFS=',' read -r -a categories <<< "$wanted"
+    for category in "${categories[@]}"; do
+        [[ -n "$category" ]] || continue
+        "$simslim_bin" profiles "$category" >/dev/null 2>&1 \
+            || fail "unknown --keep-services category '${category}'; simslim profiles lists them"
+    done
 }
 
 # Makes a leased, booted Simulator match the shared profile (plus this lease's
 # --keep-services) and prints the outcome: verified (already matched), applied
-# (reconfigured and rebooted, about 10-25 s), failed, or off.
+# (reconfigured and rebooted), failed, unsupported (simslim too old), or off.
 ensure_slim() {
     local udid="$1"
     local device_name="$2"
     local simslim_bin
+    local version
+    local timing='about 10-25 s'
     local kept
     local kept_daemons=""
+    local simslim_errors
     local -a arguments
 
     simslim_bin="$(simslim_binary)" || { printf 'off\n'; return 0; }
+    version="$(simslim_version "$simslim_bin")"
+    if [[ -n "$version" ]] && ! version_at_least "$version" "$SIMSLIM_MIN_VERSION"; then
+        printf 'simlease: simslim %s is too old (SimLease needs %s or newer), so %s is not slimmed. Run: brew upgrade simslim\n' \
+            "$version" "$SIMSLIM_MIN_VERSION" "$device_name" >&2
+        printf 'unsupported\n'
+        return 0
+    fi
+    # The 10-25 s holds from simslim 0.11. Older versions take longer.
+    if [[ -n "$version" ]] && ! version_at_least "$version" "$SIMSLIM_FAST_VERSION"; then
+        timing="simslim ${version} is slow; 0.11 or newer takes about 10-25 s"
+    fi
     kept="$(kept_services)"
     arguments=(--except "$kept")
     if [[ -f "$SIMSLIM_PROFILE" ]]; then
@@ -448,13 +538,19 @@ ensure_slim() {
         printf 'verified\n'
         return 0
     fi
-    printf 'simlease: slimming %s, keeping %s (about 10-25 s)\n' "$device_name" "$kept" >&2
-    if "$simslim_bin" on "$udid" "${arguments[@]}" >/dev/null 2>&1; then
+    printf 'simlease: slimming %s, keeping %s (%s)\n' "$device_name" "$kept" "$timing" >&2
+    if simslim_errors="$("$simslim_bin" on "$udid" "${arguments[@]}" 2>&1 >/dev/null)"; then
         printf 'applied\n'
-    else
-        printf 'simlease: simslim could not slim %s; it stays stock\n' "$device_name" >&2
-        printf 'failed\n'
+        return 0
     fi
+    printf 'simlease: simslim could not slim %s; it keeps its previous profile\n' "$device_name" >&2
+    simslim_errors="$(printf '%s\n' "$simslim_errors" | awk 'NF { line = $0 } END { print line }')"
+    [[ -z "$simslim_errors" ]] || printf 'simlease: simslim said: %s\n' "$simslim_errors" >&2
+    # simslim 0.11 shuts a booted Simulator down before it reconfigures it, so
+    # a failed `on` can leave the leased Simulator shut down. Boot it again.
+    boot_device "$udid" >/dev/null 2>&1 \
+        || printf 'simlease: %s did not boot again; release this lease and acquire another\n' "$device_name" >&2
+    printf 'failed\n'
 }
 
 is_pinned() {
@@ -1063,6 +1159,7 @@ acquire_lease() {
     [[ "$purpose" != *$'\n'* ]] || fail '--purpose must be one line'
     require_positive_integer '--ttl' "$ttl_seconds"
     require_nonnegative_integer '--wait' "$wait_seconds"
+    [[ "$android" == "true" ]] || check_keep_services
     initialize_directories
     if [[ -n "$token_file" ]]; then
         prepare_token_file "$token_file"
@@ -1451,6 +1548,7 @@ main() {
         __cleanup-stale) shift; initialize_directories; cleanup_stale_metadata_under_lock "$@" ;;
         __scale-and-acquire) shift; initialize_directories; scale_and_acquire "$@" ;;
         __android-scale-and-acquire) shift; initialize_directories; android_scale_and_acquire "$@" ;;
+        __simslim-check) check_simslim ;;
         --version|-V) printf 'simlease %s\n' "$SIMLEASE_VERSION" ;;
         -h|--help|help|'') usage ;;
         *) fail "unknown command '$1'" ;;

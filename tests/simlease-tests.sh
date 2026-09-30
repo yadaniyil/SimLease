@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2030,SC2031 # Test groups set their own environment in subshells on purpose.
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -281,17 +282,48 @@ sleep 5
 TOKEN_C=""
 
 # Every leased Simulator is slimmed with the shared profile plus the lease's
-# --keep-services. The fake simslim remembers the last `on` per device.
+# --keep-services. The fake simslim remembers the last `on` per device and acts
+# like simslim 0.11: an unknown category exits 1, `verify` exits 1 on a
+# Simulator that isn't booted, and `on` shuts a booted Simulator down,
+# reconfigures it and boots it again. With SIMLEASE_TEST_DEVICE_STATE_DIR
+# unset, every Simulator counts as booted.
 FAKE_SIMSLIM="${TEST_ROOT}/fake-simslim"
 export FAKE_SIMSLIM_STATE="${TEST_ROOT}/fake-simslim-state"
 cat > "$FAKE_SIMSLIM" <<'EOF'
 #!/usr/bin/env bash
 mkdir -p "$FAKE_SIMSLIM_STATE"
-command="$1"; udid="$2"; shift 2
+command="${1:-}"; udid="${2:-}"; shift 2 || shift $#
 printf '%s %s %s\n' "$command" "$udid" "$*" >> "${FAKE_SIMSLIM_STATE}/calls.log"
+categories=' widgets siri search icloud store pim web family health photos apps messaging connectivity '
+marker="${SIMLEASE_TEST_DEVICE_STATE_DIR:-}/${udid}.booted"
+is_booted() { [[ -z "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" || -f "$marker" ]]; }
+known() {
+    [[ "$categories" == *" $1 "* ]] && return 0
+    printf 'simslim: unknown category "%s" (see `simslim profiles`)\n' "$1" >&2
+    return 1
+}
+known_except() {
+    local category
+    [[ "${1:-}" == --except ]] || return 0
+    for category in ${2//,/ }; do known "$category" || return 1; done
+}
 case "$command" in
-    verify) [[ "$(cat "${FAKE_SIMSLIM_STATE}/${udid}" 2>/dev/null)" == "$*" ]] ;;
-    on) printf '%s' "$*" > "${FAKE_SIMSLIM_STATE}/${udid}" ;;
+    version) printf 'simslim %s\n' "${FAKE_SIMSLIM_VERSION:-0.11.0}" ;;
+    profiles) [[ -z "$udid" ]] || known "$udid" || exit 1 ;;
+    verify)
+        known_except "$@" || exit 1
+        is_booted || { printf 'simslim: %s is not booted\n' "$udid" >&2; exit 1; }
+        [[ "$(cat "${FAKE_SIMSLIM_STATE}/${udid}" 2>/dev/null)" == "$*" ]] ;;
+    on)
+        known_except "$@" || exit 1
+        [[ -z "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]] || rm -f "$marker"
+        if [[ -n "${FAKE_SIMSLIM_ON_FAILS:-}" ]]; then
+            printf 'simslim: shutting down %s\n' "$udid" >&2
+            printf 'simslim: boot timed out after 10m0s\n' >&2
+            exit 1
+        fi
+        printf '%s' "$*" > "${FAKE_SIMSLIM_STATE}/${udid}"
+        [[ -z "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]] || : > "$marker" ;;
 esac
 EOF
 chmod +x "$FAKE_SIMSLIM"
@@ -321,6 +353,84 @@ TOKEN_C="$(jq -r '.token' <<<"$SLIM_LEASE")"
 [[ "$(jq -r '.slim' <<<"$SLIM_LEASE")" == 'off' ]] || fail 'SIMLEASE_SLIM=0 did not turn slimming off'
 "$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null
 TOKEN_C=""
+
+# An unknown --keep-services category fails before any lease is taken.
+set +e
+SIMLEASE_SIMSLIM_BIN="$FAKE_SIMSLIM" "$LEASE_TOOL" acquire --device "$UDID_A" --owner slim-bad \
+    --keep-services 'widgets, bogus' --ttl 30 --json >/dev/null 2>"${TEST_ROOT}/bad-category.err"
+STATUS_BAD=$?
+set -e
+[[ "$STATUS_BAD" -eq 1 ]] || fail "an unknown --keep-services category exited ${STATUS_BAD}, not 1"
+grep -q "unknown --keep-services category 'bogus'" "${TEST_ROOT}/bad-category.err" || fail 'an unknown category failed for the wrong reason'
+[[ "$(leases_owned_by slim-bad)" == '0' ]] || fail 'an unknown --keep-services category left a lease'
+
+# simslim older than 0.6.1 is unsupported: the lease is granted, not slimmed.
+: > "${FAKE_SIMSLIM_STATE}/calls.log"
+SLIM_LEASE="$(FAKE_SIMSLIM_VERSION=0.6.0 SIMLEASE_SIMSLIM_BIN="$FAKE_SIMSLIM" "$LEASE_TOOL" acquire --device "$UDID_A" \
+    --owner slim-old --ttl 30 --json 2>"${TEST_ROOT}/old-simslim.err")"
+TOKEN_C="$(jq -r '.token' <<<"$SLIM_LEASE")"
+[[ "$(jq -r '.slim' <<<"$SLIM_LEASE")" == 'unsupported' ]] || fail 'simslim 0.6.0 was not reported as unsupported'
+grep -q 'simslim 0.6.0 is too old' "${TEST_ROOT}/old-simslim.err" || fail 'an unsupported simslim gave no warning'
+! grep -qE '^(verify|on) ' "${FAKE_SIMSLIM_STATE}/calls.log" || fail 'an unsupported simslim was used to slim'
+"$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null
+TOKEN_C=""
+simslim_check() {
+    SIMLEASE_SIMSLIM_BIN="$FAKE_SIMSLIM" FAKE_SIMSLIM_VERSION="$1" "$LEASE_TOOL" __simslim-check 2>&1
+}
+[[ "$(simslim_check 0.11.0)" == 'simslim 0.11.0' ]] || fail 'the simslim check did not print the version'
+grep -q '0.11 or newer slims much faster' <<<"$(simslim_check 0.10.2)" || fail 'the simslim check did not warn below 0.11'
+grep -q 'simslim 0.6.0 is unsupported' <<<"$(simslim_check 0.6.0)" || fail 'the simslim check did not warn below 0.6.1'
+grep -q 'could not read the version' <<<"$(simslim_check dev)" || fail 'the simslim check failed on an unreadable version'
+pool_cap() {
+    SIMLEASE_SIMSLIM_BIN="$FAKE_SIMSLIM" FAKE_SIMSLIM_VERSION="$1" SIMLEASE_TEST_TOTAL_MEMORY_MB=65536 \
+        SIMLEASE_TEST_FREE_MEMORY_PERCENT=50 "$LEASE_TOOL" status --json | jq -r '.capacity.maxBootedSimulators'
+}
+[[ "$(pool_cap 0.11.0)" == '6' && "$(pool_cap 0.6.0)" == '3' ]] || fail 'an unsupported simslim still raised the pool cap'
+
+# A failed `simslim on` keeps the lease. simslim 0.11 shuts a booted Simulator
+# down first, so simlease boots it again.
+SLIM_ROOT="${TEST_ROOT}/slim-state"
+(
+    export SIMLEASE_DIR="${SLIM_ROOT}/leases"
+    export SIMLEASE_DEVICES=$'77777777-7777-7777-7777-777777777777\tiPhone Slim Listed'
+    export SIMLEASE_SHUTDOWN_DEVICES=$'88888888-8888-8888-8888-888888888888\tiPhone Slim Fails'
+    export SIMLEASE_TEST_DEVICE_STATE_DIR="${SLIM_ROOT}/device-state"
+    export SIMLEASE_TEST_TOTAL_MEMORY_MB=32768
+    export SIMLEASE_TEST_FREE_MEMORY_PERCENT=50
+    export SIMLEASE_MAX_BOOTED_SIMULATORS=4
+    export SIMLEASE_SIMSLIM_BIN="$FAKE_SIMSLIM"
+    mkdir -p "$SIMLEASE_TEST_DEVICE_STATE_DIR"
+    LISTED_UDID='77777777-7777-7777-7777-777777777777'
+    FAILING_UDID='88888888-8888-8888-8888-888888888888'
+    FAILING_TOKEN=''
+    LISTED_TOKEN=''
+    trap '[[ -z "$FAILING_TOKEN" ]] || "$LEASE_TOOL" release --token "$FAILING_TOKEN" >/dev/null 2>&1 || true; [[ -z "$LISTED_TOKEN" ]] || "$LEASE_TOOL" release --token "$LISTED_TOKEN" >/dev/null 2>&1 || true' EXIT
+
+    FAILING_LEASE="$(FAKE_SIMSLIM_ON_FAILS=1 "$LEASE_TOOL" acquire --device "$FAILING_UDID" --boot-if-needed \
+        --owner slim-fails --ttl 30 --json 2>"${SLIM_ROOT}/on-fails.err")"
+    FAILING_TOKEN="$(jq -r '.token' <<<"$FAILING_LEASE")"
+    [[ "$(jq -r '.slim' <<<"$FAILING_LEASE")" == 'failed' ]] || fail 'a failed simslim on was not reported as slim: failed'
+    [[ -f "${SIMLEASE_TEST_DEVICE_STATE_DIR}/${FAILING_UDID}.booted" ]] || fail 'a failed simslim on left the Simulator shut down'
+    grep -q 'keeps its previous profile' "${SLIM_ROOT}/on-fails.err" || fail 'a failed simslim on gave the wrong message'
+    grep -q 'simslim said: simslim: boot timed out after 10m0s' "${SLIM_ROOT}/on-fails.err" || fail "simslim's last error line was not shown"
+    "$LEASE_TOOL" exec --token "$FAILING_TOKEN" -- true || fail 'the lease did not survive a failed simslim on'
+    "$LEASE_TOOL" release --token "$FAILING_TOKEN" >/dev/null
+    FAILING_TOKEN=''
+
+    # `verify` exits 1 on a Simulator that isn't booted (this one shut down
+    # after it was listed); `on` then slims it and boots it.
+    set +e
+    "$FAKE_SIMSLIM" verify "$LISTED_UDID" --except photos >/dev/null 2>&1
+    STATUS_VERIFY=$?
+    set -e
+    [[ "$STATUS_VERIFY" -eq 1 ]] || fail "verify on a Simulator that isn't booted exited ${STATUS_VERIFY}, not 1"
+    LISTED_LEASE="$("$LEASE_TOOL" acquire --device "$LISTED_UDID" --owner slim-shut --ttl 30 --json 2>/dev/null)"
+    LISTED_TOKEN="$(jq -r '.token' <<<"$LISTED_LEASE")"
+    [[ "$(jq -r '.slim' <<<"$LISTED_LEASE")" == 'applied' ]] || fail 'a Simulator that failed verify was not slimmed'
+    [[ -f "${SIMLEASE_TEST_DEVICE_STATE_DIR}/${LISTED_UDID}.booted" ]] || fail 'slimming did not leave the Simulator booted'
+    "$LEASE_TOOL" release --token "$LISTED_TOKEN" >/dev/null
+    LISTED_TOKEN=''
+)
 
 # Pinned Simulators are skipped by automatic picks and leased only by --device.
 printf '%s   # signed in, keep\n' "$UDID_A" > "${SIMLEASE_CONFIG_DIR}/pinned"
