@@ -48,8 +48,10 @@ simlease exec --token-file "<scratch>/emu.token" -- adb logcat -d
 
 ## Slim Simulators
 
-- SimLease slims every leased Simulator with one shared simslim profile. Never run `simslim on` or `off` yourself: slimming persists on the device, and another project's app would lose services.
+- SimLease slims every leased Simulator with one shared simslim profile. Never run simslim commands that change a device: `on`, `off`, `watch`, `clone`, `repair-clone`, `erase`, `delete`, `disk-clean`, `boot`, `shutdown`, `rename`. Slimming persists on the device, so another project's app would lose services. `watch` slims every Simulator as it boots, other agents' too, and `repair-clone` can keep another agent's Simulator shut down.
+- Read-only simslim commands are fine: `list`, `profiles`, `status`, `verify`, `doctor`, `measure`, `size`, `top --json`, `disk-plan`.
 - If the app needs more than the profile keeps (widgets, speech, contacts, HealthKit), acquire with `--keep-services <categories>`. `simslim profiles` lists the categories.
+- To check that the leased Simulator has the features the app needs, run `simslim doctor` inside the lease: `simlease exec --token-file "<scratch>/sim.token" -- sh -c 'simslim doctor "$SIMULATOR_UDID" --requires <features>'`. `simslim doctor --list` lists the features.
 
 ## Pinned Simulators
 

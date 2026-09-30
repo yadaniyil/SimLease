@@ -92,10 +92,106 @@ def main() -> None:
         for command in (
             "pkill -f 'qemu-system.* -port 5560'",
             "pkill -f 'flutter_tools.snapshot run -d emulator-5560'",
-            "simslim status 11111111-1111-1111-1111-111111111111",
-            "simslim list",
         ):
             assert not bash_denied(command), command
+
+        # simslim commands that change a device are blocked, even inside a lease,
+        # however simslim is spelled or started and whatever global options come first.
+        for command in (
+            f"simslim on {UDID}",
+            f"simslim on {UDID} --no-reboot",
+            f"simslim off {UDID}",
+            "simslim watch",
+            "simslim --spawn-timeout 5m watch",
+            f"simslim repair-clone {UDID} 22222222-2222-2222-2222-222222222222",
+            f"simslim clone {UDID} Copy",
+            f"simslim erase {UDID}",
+            f"simslim delete {UDID}",
+            f"simslim disk-clean {UDID} --categories caches --confirm",
+            f"simslim shutdown {UDID}",
+            f"simslim boot {UDID}",
+            f"simslim rename {UDID} New",
+            f"simslim --boot-timeout 15m on {UDID}",
+            f"simslim --boot-timeout=15m off {UDID}",
+            f"simslim --set testing on {UDID}",
+            f'simslim --set "my set" on {UDID}',
+            f"SimSlim on {UDID}",
+            f'"simslim" on {UDID}',
+            f"'simslim' on {UDID}",
+            f"$(which simslim) on {UDID}",
+            f"`which simslim` on {UDID}",
+            f"/opt/homebrew/bin/simslim on {UDID}",
+            f"env X=1 simslim on {UDID}",
+            f"X=1 simslim on {UDID}",
+            f"sudo simslim on {UDID}",
+            f"echo {UDID} | xargs simslim on",
+        ):
+            assert bash_denied(command), command
+        reason = invoke("Bash", {"command": "simslim watch"}, workspace, lease_root)["systemMessage"]
+        assert "`simslim watch`" in reason and "other agents'" in reason and "doctor" in reason, reason
+        reason = invoke("Bash", {"command": "simslim repair-clone A B"}, workspace, lease_root)["systemMessage"]
+        assert "`simslim repair-clone`" in reason and "shut down" in reason, reason
+        # Read-only simslim commands pass.
+        for command in (
+            "simslim list",
+            "simslim list --json",
+            "simslim list --booted",
+            "simslim profiles",
+            "simslim profiles store",
+            f"simslim status {UDID}",
+            f"simslim status {UDID} --dropped",
+            f"simslim verify {UDID} --except photos,store",
+            "simslim doctor --list",
+            f"simslim doctor {UDID} --requires push,storekit",
+            f"simslim doctor {UDID} --requires push --json",
+            f"simslim measure {UDID}",
+            f"simslim size {UDID}",
+            "simslim top",
+            "simslim top --json",
+            f"simslim disk-plan {UDID}",
+            "simslim disk-categories",
+            "simslim version",
+            "simslim --help",
+            "simslim --boot-timeout 15m list",
+            "simslim profile ./dev.json",
+        ):
+            assert not bash_denied(command), command
+
+        # Read-only simctl needs no lease; anything else still does.
+        for command in (
+            "xcrun simctl list devices -j",
+            "xcrun simctl list devices booted",
+            "xcrun simctl list devices | grep -i booted",
+            "xcrun simctl help",
+        ):
+            assert not bash_denied(command), command
+        for command in (
+            f"xcrun simctl boot {UDID}",
+            f"xcrun simctl list devices -j; xcrun simctl boot {UDID}",
+        ):
+            assert bash_denied(command), command
+
+        # Text searches may mention device commands; a device command next to one is still caught.
+        for command in (
+            'grep -rn "xcrun simctl" .',
+            "rg booted docs/",
+            'rg -n "xcrun simctl io booted" docs/',
+            'grep -rn "simslim on" README.md',
+            'git grep -n "xcrun simctl"',
+            'ag "killall Simulator" .',
+            'grep -rn "xcrun simctl" . | head -5',
+        ):
+            assert not bash_denied(command), command
+        for command in (
+            f'grep -rn "xcrun simctl" . ; xcrun simctl boot {UDID}',
+            'grep -rn "xcrun simctl" . && simslim watch',
+            f"grep foo $(xcrun simctl boot {UDID})",
+            f"grep foo `simslim on {UDID}`",
+            f'rg --pre "xcrun simctl boot {UDID}" foo',
+            "grep -l x . | xargs simslim on",
+            'grep "simlease exec --token t" . ; xcrun simctl boot X',
+        ):
+            assert bash_denied(command), command
 
         assert not invoke("mcp__xcodebuildmcp__list_sims", {}, workspace, lease_root)
         assert is_denied(invoke("mcp__xcodebuildmcp__build_sim", {}, workspace, lease_root))

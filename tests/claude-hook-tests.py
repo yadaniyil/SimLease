@@ -32,6 +32,14 @@ def main() -> None:
         assert not bash("simlease exec --token-file t -- adb shell getprop")
         assert bash("simlease exec --token-file t -- xcrun simctl shutdown all")
         assert bash("simlease exec --token-file t -- simslim on $SIMULATOR_UDID")
+        for command in ("simslim watch", f"simslim --boot-timeout 15m on {SIM}", f"simslim repair-clone {SIM} B",
+                        f"SimSlim on {SIM}", f"$(which simslim) on {SIM}", f"sudo simslim off {SIM}"):
+            assert bash(command), command
+        for command in ("simslim list", "simslim doctor --list", f"simslim doctor {SIM} --requires push --json",
+                        "simslim top --json", "simslim version", "xcrun simctl list devices -j",
+                        'grep -rn "xcrun simctl" .', "rg booted docs/"):
+            assert not bash(command), command
+        assert bash(f'grep -rn "xcrun simctl" . ; xcrun simctl boot {SIM}')
         assert bash("killall Simulator")
         assert not bash("git status")
         assert not denied("TaskStop", {"task_id": "x"}, lease_root)
