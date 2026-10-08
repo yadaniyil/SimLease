@@ -9,6 +9,15 @@ LEASE_DIR="${LEASE_ROOT}/leases"
 SIGNAL_DIR="${LEASE_ROOT}/signals"
 HANDSHAKE_DIR="${LEASE_ROOT}/handshakes"
 DERIVED_DATA_ROOT="${LEASE_ROOT}/derived-data"
+# A project on a volume other than the boot volume keeps its DerivedData in this
+# folder at the root of that volume, so it never fills the internal disk. Each
+# project's <key> folder there carries a marker file that names the project:
+# macOS cleans the default location in TMPDIR, and nothing cleans a volume.
+DERIVED_DATA_VOLUME_FOLDER='simlease-derived-data'
+DERIVED_DATA_MARKER='simlease-project.json'
+# Set by choose_derived_data_dir.
+DERIVED_DATA_PROJECT_DIR=""
+DERIVED_DATA_WARNING=""
 RUNTIME_ROOT="${SIMLEASE_RUNTIME_DIR:-${TMPDIR:-/tmp}/simlease-runtime}"
 POOL_LOCK_PATH="${LOCK_DIR}/pool.lock"
 SERVE_SIM_STATE_DIR="${SIMLEASE_SERVE_SIM_STATE_DIR:-${TMPDIR:-/tmp}/serve-sim}"
@@ -43,6 +52,7 @@ Usage:
   simlease renew --token TOKEN [--ttl SECONDS] [--json]
   simlease release --token TOKEN [--json]
   simlease exec --token TOKEN -- COMMAND [ARG ...]
+  simlease prune [--dir FOLDER] [--delete]
 
 renew, release and exec also take --token-file PATH in place of --token TOKEN.
 exec keeps renewing the lease while COMMAND runs, so a long run outlives the TTL.
@@ -79,7 +89,20 @@ faster). `scripts/preflight` checks the version. The shared profile is
 except: photos,store,icloud,web). SIMLEASE_SLIM=0 turns slimming off.
 ~/.config/simlease/pinned lists Simulator UDIDs automatic picks skip.
 
+DERIVED_DATA_PATH is SIMLEASE_DIR/derived-data/<key>/<UDID>, where <key> comes
+from the folder acquire ran in. A project on a volume other than the boot volume
+(an external disk) gets <volume>/simlease-derived-data/<key>/<UDID> instead, so
+its DerivedData stays on that volume. If that folder cannot be written, the lease
+warns and uses the default. Each <key> folder on a volume holds
+simlease-project.json, which names its project.
+prune lists the <key> folders in a volume's simlease-derived-data whose project
+folder is gone, and removes them only with --delete. It never touches a folder
+without that file or one an active lease points into. Nothing is removed
+automatically. Without --dir it looks at the volume of the current folder.
+
 SIMLEASE_DIR overrides the shared state directory.
+SIMLEASE_DERIVED_DATA_DIR puts every project's DerivedData under that folder
+(absolute path), as <key>/<UDID>. It changes nothing else.
 SIMLEASE_WORKSPACE overrides the workspace recorded in lease metadata.
 SIMLEASE_DEVICES may contain test-only TSV device rows.
 SIMLEASE_MIN_FREE_MEMORY_MB defaults to 4096.
@@ -173,7 +196,86 @@ utc_timestamp() {
 }
 
 workspace_key() {
-    printf '%s' "$PROJECT_ROOT" | shasum -a 256 | awk '{print substr($1, 1, 12)}'
+    printf '%s' "${1:-$PROJECT_ROOT}" | shasum -a 256 | awk '{print substr($1, 1, 12)}'
+}
+
+# The device number of the volume that holds a path, or nothing.
+volume_device() {
+    /usr/bin/stat -L -f '%d' "$1" 2>/dev/null || true
+}
+
+# Prints the mount point of the volume the project lives on when that is not the
+# boot volume, and nothing otherwise. Device numbers decide it, not mount point
+# names: `df` reports /System/Volumes/Data for every path on the boot volume,
+# and a volume name may contain spaces.
+project_volume() {
+    local path
+    local device
+    local boot_device
+    local parent
+
+    path="$(cd -- "$PROJECT_ROOT" >/dev/null 2>&1 && pwd -P)" || return 0
+    device="$(volume_device "$path")"
+    boot_device="$(volume_device /)"
+    # Anything but two plain numbers means the volume is unknown: keep the default.
+    [[ "$device" =~ ^[0-9]+$ && "$boot_device" =~ ^[0-9]+$ ]] || return 0
+    [[ "$device" != "$boot_device" && "$device" != "$(volume_device /System/Volumes/Data)" ]] || return 0
+    # The mount point is the highest folder that is still on the project's volume.
+    while [[ "$path" != "/" ]]; do
+        parent="${path%/*}"
+        [[ -n "$parent" ]] || parent="/"
+        [[ "$(volume_device "$parent")" == "$device" ]] || break
+        path="$parent"
+    done
+    [[ "$path" != "/" ]] || return 0
+    printf '%s\n' "$path"
+}
+
+# Writes the marker that names the project a DerivedData <key> folder belongs
+# to, unless the folder already has one.
+mark_derived_data_dir() {
+    local marker="$1/${DERIVED_DATA_MARKER}"
+    [[ ! -s "$marker" ]] || return 0
+    {
+        jq -n --arg project "$PROJECT_ROOT" --arg createdAt "$(utc_timestamp "$(date +%s)")" \
+            '{project:$project,createdAt:$createdAt}' > "${marker}.tmp.$$" \
+            && mv "${marker}.tmp.$$" "$marker"
+    } 2>/dev/null && return 0
+    rm -f "${marker}.tmp.$$" 2>/dev/null || true
+    return 1
+}
+
+# Decides where this project's DerivedData goes: SIMLEASE_DERIVED_DATA_DIR when
+# set, else the project's own volume when that is not the boot volume, else the
+# default under the lease directory. Sets DERIVED_DATA_PROJECT_DIR, and
+# DERIVED_DATA_WARNING when the wanted folder cannot be used. A lease never
+# fails over this: it uses the default instead. Nothing is created in the
+# default location; xcodebuild creates that folder itself.
+choose_derived_data_dir() {
+    local key
+    local wanted_root
+    local volume
+
+    key="$(workspace_key)"
+    DERIVED_DATA_PROJECT_DIR="${DERIVED_DATA_ROOT}/${key}"
+    DERIVED_DATA_WARNING=""
+    if [[ -n "${SIMLEASE_DERIVED_DATA_DIR:-}" ]]; then
+        wanted_root="${SIMLEASE_DERIVED_DATA_DIR%/}"
+        if [[ "$wanted_root" != /* ]]; then
+            DERIVED_DATA_WARNING="SIMLEASE_DERIVED_DATA_DIR must be an absolute path; DerivedData goes to ${DERIVED_DATA_ROOT} instead"
+            return 0
+        fi
+    else
+        volume="$(project_volume)" || true
+        [[ -n "$volume" ]] || return 0
+        wanted_root="${volume}/${DERIVED_DATA_VOLUME_FOLDER}"
+    fi
+    if ( umask 077; mkdir -p "${wanted_root}/${key}" ) 2>/dev/null \
+        && [[ -w "${wanted_root}/${key}" ]] && mark_derived_data_dir "${wanted_root}/${key}"; then
+        DERIVED_DATA_PROJECT_DIR="${wanted_root}/${key}"
+    else
+        DERIVED_DATA_WARNING="cannot write DerivedData to ${wanted_root}; it goes to ${DERIVED_DATA_ROOT} instead"
+    fi
 }
 
 booted_devices() {
@@ -912,7 +1014,13 @@ try_acquire_device() {
     hashed_token="$(token_hash "$token")"
     acquired_epoch="$(date +%s)"
     expires_epoch=$(( acquired_epoch + ttl_seconds ))
-    derived_data_path="${DERIVED_DATA_ROOT}/$(workspace_key)/${udid}"
+    if is_android_id "$udid"; then
+        # An emulator lease builds no DerivedData; its metadata keeps the old path.
+        derived_data_path="${DERIVED_DATA_ROOT}/$(workspace_key)/${udid}"
+    else
+        choose_derived_data_dir
+        derived_data_path="${DERIVED_DATA_PROJECT_DIR}/${udid}"
+    fi
     ready_file="${HANDSHAKE_DIR}/${hashed_token}.ready"
     acknowledged_file="${HANDSHAKE_DIR}/${hashed_token}.ack"
     guard_label="com.simlease.guard.${hashed_token:0:32}"
@@ -967,6 +1075,7 @@ try_acquire_device() {
                 fail "could not write the token to '${SIMLEASE_TOKEN_FILE_OUT}'"
             fi
             : > "$acknowledged_file"
+            [[ -z "$DERIVED_DATA_WARNING" ]] || printf 'simlease: %s\n' "$DERIVED_DATA_WARNING" >&2 || true
             is_android_id "$udid" || slim_state="$(ensure_slim "$udid" "$device_name")"
             if [[ "$output_json" == "true" ]] && is_android_id "$udid"; then
                 jq -n \
@@ -1575,6 +1684,96 @@ execute_with_lease() {
     exec "$@"
 }
 
+# True when a lease's DerivedData path lies in the folder. Folders are compared
+# by device and inode, so another spelling of the same path still matches. A
+# folder that cannot be read counts as leased.
+derived_data_dir_is_leased() {
+    local identity
+    local metadata
+    local leased_path
+
+    identity="$(/usr/bin/stat -L -f '%d:%i' "$1" 2>/dev/null || true)"
+    [[ -n "$identity" ]] || return 0
+    for metadata in "$LEASE_DIR"/*.json; do
+        [[ -f "$metadata" ]] || continue
+        leased_path="$(jq -r '.derivedDataPath // empty' "$metadata" 2>/dev/null || true)"
+        [[ -n "$leased_path" ]] || continue
+        [[ "$(/usr/bin/stat -L -f '%d:%i' "${leased_path%/*}" 2>/dev/null || true)" != "$identity" ]] || return 0
+    done
+    return 1
+}
+
+# Lists the DerivedData <key> folders under a volume's simlease-derived-data
+# (or SIMLEASE_DERIVED_DATA_DIR) whose project folder is gone, and removes them
+# only with --delete. A folder counts only when it carries the marker written
+# at acquire and the marker's project hashes to the folder's name. A folder a
+# lease points into is never touched, and neither is one whose project may be
+# on a volume that is not mounted.
+prune_derived_data() {
+    local root=""
+    local wanted_root
+    local delete=false
+    local key_dir
+    local key
+    local project
+    local state
+    local stale=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dir) [[ $# -ge 2 ]] || fail '--dir requires a folder'; root="$2"; shift 2 ;;
+            --delete) delete=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) fail "unknown prune option '$1'" ;;
+        esac
+    done
+    initialize_directories
+    if [[ -z "$root" && -n "${SIMLEASE_DERIVED_DATA_DIR:-}" ]]; then
+        root="$SIMLEASE_DERIVED_DATA_DIR"
+    elif [[ -z "$root" ]]; then
+        root="$(project_volume)" || true
+        [[ -n "$root" ]] || fail 'this folder is on the boot volume, where DerivedData sits in the temporary folder macOS cleans; pass --dir FOLDER'
+        root="${root}/${DERIVED_DATA_VOLUME_FOLDER}"
+    fi
+    wanted_root="$root"
+    if [[ ! -d "$root" ]]; then
+        printf 'No DerivedData folder at %s\n' "$root"
+        return 0
+    fi
+    root="$(cd -- "$root" >/dev/null 2>&1 && pwd -P)" || fail "cannot read '${wanted_root}'"
+    [[ "$root" != "/" ]] || fail '--dir must not be /'
+
+    for key_dir in "$root"/*; do
+        key="${key_dir##*/}"
+        [[ "$key" =~ ^[0-9a-f]{12}$ && -d "$key_dir" && ! -L "$key_dir" ]] || continue
+        project="$(jq -r '.project // empty' "${key_dir}/${DERIVED_DATA_MARKER}" 2>/dev/null || true)"
+        [[ -n "$project" && "$(workspace_key "$project")" == "$key" ]] || continue
+        if derived_data_dir_is_leased "$key_dir"; then
+            state='leased'
+        elif [[ -e "$project" ]]; then
+            state='in-use'
+        elif [[ ! -d "${project%/*}" ]]; then
+            # The project's parent folder is missing too: it was moved, or its
+            # volume is not mounted. Too uncertain to call stale.
+            state='unknown'
+        elif [[ "$delete" == "true" ]] && rm -rf -- "$key_dir" 2>/dev/null; then
+            state='deleted'
+            stale=$(( stale + 1 ))
+        elif [[ "$delete" == "true" ]]; then
+            state='not-deleted'
+        else
+            state='stale'
+            stale=$(( stale + 1 ))
+        fi
+        printf '%s\t%s\t%s\n' "$state" "$key_dir" "$project"
+    done
+    if [[ "$delete" == "true" ]]; then
+        printf 'Deleted %s DerivedData folder(s) in %s\n' "$stale" "$root"
+    else
+        printf '%s stale DerivedData folder(s) in %s; nothing was deleted. Add --delete to remove them.\n' "$stale" "$root"
+    fi
+}
+
 main() {
     require_command install
     require_command jq
@@ -1589,6 +1788,7 @@ main() {
         renew) shift; renew_lease "$@" ;;
         release) shift; release_lease "$@" ;;
         exec) shift; execute_with_lease "$@" ;;
+        prune) shift; prune_derived_data "$@" ;;
         __guard) shift; initialize_directories; guard_lease "$@" ;;
         __launchd-guard) shift; initialize_directories; launchd_guard_entry "$@" ;;
         __cleanup-stale) shift; initialize_directories; cleanup_stale_metadata_under_lock "$@" ;;

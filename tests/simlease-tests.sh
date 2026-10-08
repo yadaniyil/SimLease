@@ -10,7 +10,11 @@ export SIMLEASE_DEVICES=$'11111111-1111-1111-1111-111111111111\tiPhone Test One\
 export SIMLEASE_SERVE_SIM_STATE_DIR="${TEST_ROOT}/serve-sim"
 # Keeps the Mac's real simslim profile and pinned list out of the tests.
 export SIMLEASE_CONFIG_DIR="${TEST_ROOT}/config"
-mkdir -p "$SIMLEASE_SERVE_SIM_STATE_DIR"
+# A checkout on an external volume would get DerivedData folders on that volume:
+# the tests lease from a workspace inside the test folder instead.
+export SIMLEASE_WORKSPACE="${TEST_ROOT}/workspace"
+unset SIMLEASE_DERIVED_DATA_DIR
+mkdir -p "$SIMLEASE_SERVE_SIM_STATE_DIR" "$SIMLEASE_WORKSPACE"
 
 # macOS /bin/bash 3.2 ignores `set -e` when `[[ ... ]]` fails, so every
 # assertion fails explicitly: `[[ ... ]] || fail 'message'`.
@@ -22,11 +26,14 @@ fail() {
 TOKEN_A=""
 TOKEN_B=""
 TOKEN_C=""
+# The mount point of the test disk image while it is attached.
+TEST_VOLUME=""
 
 cleanup() {
     [[ -z "$TOKEN_A" ]] || "$LEASE_TOOL" release --token "$TOKEN_A" >/dev/null 2>&1 || true
     [[ -z "$TOKEN_B" ]] || "$LEASE_TOOL" release --token "$TOKEN_B" >/dev/null 2>&1 || true
     [[ -z "$TOKEN_C" ]] || "$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null 2>&1 || true
+    [[ -z "$TEST_VOLUME" ]] || hdiutil detach -quiet -force "$TEST_VOLUME" >/dev/null 2>&1 || true
     rm -rf "$TEST_ROOT"
 }
 trap cleanup EXIT
@@ -448,6 +455,141 @@ TOKEN_B=""
 "$LEASE_TOOL" release --token "$TOKEN_C" >/dev/null
 TOKEN_C=""
 rm -f "${SIMLEASE_CONFIG_DIR}/pinned"
+
+# DerivedData. A project on the boot volume keeps the path it always had. A
+# project on another volume gets a folder at the root of that volume. The
+# volume here is a disk image mounted at a path with a space in it.
+derived_key() {
+    printf '%s' "$1" | shasum -a 256 | awk '{print substr($1, 1, 12)}'
+}
+# Leases UDID_A from a workspace (and an optional SIMLEASE_DERIVED_DATA_DIR),
+# prints the DerivedData path of the lease, and releases it. The acquire's
+# stderr lands in derived.err.
+leased_derived_data_path() {
+    local lease
+    local token
+    local path
+    lease="$(SIMLEASE_WORKSPACE="$1" SIMLEASE_DERIVED_DATA_DIR="${2:-}" "$LEASE_TOOL" acquire --device "$UDID_A" \
+        --owner derived-data --ttl 30 --json 2>"${TEST_ROOT}/derived.err")"
+    token="$(jq -r '.token' <<<"$lease")"
+    # shellcheck disable=SC2016 # The variable expands inside the leased child shell.
+    path="$("$LEASE_TOOL" exec --token "$token" -- sh -c 'printf "%s" "$DERIVED_DATA_PATH"')"
+    "$LEASE_TOOL" release --token "$token" >/dev/null
+    [[ "$path" == "$(jq -r '.derivedDataPath' <<<"$lease")" ]] || fail 'exec and acquire disagree on the DerivedData path'
+    printf '%s\n' "$path"
+}
+# The state `prune` printed for a project.
+prune_state() {
+    awk -F '\t' -v project="$2" '$3 == project { print $1 }' <<<"$1"
+}
+DEFAULT_DERIVED_ROOT="${SIMLEASE_DIR}/derived-data"
+BOOT_PROJECT="${TEST_ROOT}/boot project"
+MISSING_PROJECT="${TEST_ROOT}/no such project"
+mkdir -p "$BOOT_PROJECT"
+[[ "$(leased_derived_data_path "$BOOT_PROJECT")" == "${DEFAULT_DERIVED_ROOT}/$(derived_key "$BOOT_PROJECT")/${UDID_A}" ]] \
+    || fail 'a project on the boot volume did not keep the default DerivedData path'
+! grep -q 'DerivedData' "${TEST_ROOT}/derived.err" || fail 'a project on the boot volume got a DerivedData warning'
+[[ ! -e "${DEFAULT_DERIVED_ROOT}/$(derived_key "$BOOT_PROJECT")" ]] || fail 'the default DerivedData location got a folder it never had before'
+[[ "$(leased_derived_data_path "$MISSING_PROJECT")" == "${DEFAULT_DERIVED_ROOT}/$(derived_key "$MISSING_PROJECT")/${UDID_A}" ]] \
+    || fail 'a workspace that does not exist did not get the default DerivedData path'
+"$LEASE_TOOL" prune >/dev/null 2>&1 && fail 'prune on the boot volume did not ask for --dir'
+
+TEST_VOLUME="${TEST_ROOT}/ext vol"
+mkdir -p "$TEST_VOLUME"
+hdiutil create -quiet -size 4m -fs HFS+ -volname 'SimLease Test' "${TEST_ROOT}/volume.dmg"
+hdiutil attach -quiet -nobrowse -mountpoint "$TEST_VOLUME" "${TEST_ROOT}/volume.dmg"
+VOLUME_PROJECT="${TEST_VOLUME}/dev/app one"
+VOLUME_PROJECT_TWO="${TEST_VOLUME}/dev/app two"
+mkdir -p "${VOLUME_PROJECT}/ios" "$VOLUME_PROJECT_TWO"
+# The lease reports the physical mount point: /var is a link to /private/var.
+VOLUME_DERIVED_ROOT="$(cd "$TEST_VOLUME" && pwd -P)/simlease-derived-data"
+VOLUME_KEY="$(derived_key "$VOLUME_PROJECT")"
+[[ "$(leased_derived_data_path "$VOLUME_PROJECT")" == "${VOLUME_DERIVED_ROOT}/${VOLUME_KEY}/${UDID_A}" ]] \
+    || fail 'a project on another volume did not get DerivedData on that volume'
+! grep -q 'DerivedData' "${TEST_ROOT}/derived.err" || fail 'a writable volume gave a DerivedData warning'
+[[ "$(jq -r '.project' "${VOLUME_DERIVED_ROOT}/${VOLUME_KEY}/simlease-project.json")" == "$VOLUME_PROJECT" ]] \
+    || fail 'the DerivedData folder on the volume has no marker that names its project'
+[[ "$(leased_derived_data_path "${VOLUME_PROJECT}/ios")" == "${VOLUME_DERIVED_ROOT}/$(derived_key "${VOLUME_PROJECT}/ios")/${UDID_A}" ]] \
+    || fail 'a subfolder of a project on another volume did not use the folder at the volume root'
+[[ "$(prune_state "$(SIMLEASE_WORKSPACE="$VOLUME_PROJECT" "$LEASE_TOOL" prune)" "$VOLUME_PROJECT")" == 'in-use' ]] \
+    || fail 'prune did not find the DerivedData folder of the current volume'
+# An emulator lease has no DerivedData: nothing of it lands on the volume.
+(
+    export SIMLEASE_ANDROID_TEST_STATE_DIR="${TEST_ROOT}/android-derived"
+    export SIMLEASE_ANDROID_AVDS='avd_shared'
+    export ANDROID_AVD_HOME="${TEST_ROOT}/avd-home"
+    export SIMLEASE_MAX_EMULATORS=1
+    AND_TOKEN="$(SIMLEASE_WORKSPACE="$VOLUME_PROJECT_TWO" "$LEASE_TOOL" acquire --avd avd_shared --owner and-derived --ttl 30 --json | jq -r '.token')"
+    AND_PATH="$("$LEASE_TOOL" status --json | jq -r '.devices[] | select(.lease.owner == "and-derived") | .lease.derivedDataPath')"
+    "$LEASE_TOOL" release --token "$AND_TOKEN" >/dev/null
+    [[ "$AND_PATH" == "${DEFAULT_DERIVED_ROOT}/$(derived_key "$VOLUME_PROJECT_TWO")/emulator-"* ]] \
+        || fail 'an emulator lease did not keep the default DerivedData path in its metadata'
+)
+[[ ! -e "${VOLUME_DERIVED_ROOT}/$(derived_key "$VOLUME_PROJECT_TWO")" ]] || fail 'an emulator lease created a DerivedData folder on the volume'
+
+# SIMLEASE_DERIVED_DATA_DIR moves DerivedData only, for a project on any volume.
+OVERRIDE_ROOT="${TEST_ROOT}/derived override"
+[[ "$(leased_derived_data_path "$BOOT_PROJECT" "$OVERRIDE_ROOT")" == "${OVERRIDE_ROOT}/$(derived_key "$BOOT_PROJECT")/${UDID_A}" ]] \
+    || fail 'SIMLEASE_DERIVED_DATA_DIR was not used for a project on the boot volume'
+[[ "$(leased_derived_data_path "$VOLUME_PROJECT" "${OVERRIDE_ROOT}/")" == "${OVERRIDE_ROOT}/${VOLUME_KEY}/${UDID_A}" ]] \
+    || fail 'SIMLEASE_DERIVED_DATA_DIR did not win over the project volume'
+[[ "$(jq -r '.project' "${OVERRIDE_ROOT}/${VOLUME_KEY}/simlease-project.json")" == "$VOLUME_PROJECT" ]] \
+    || fail 'the folder under SIMLEASE_DERIVED_DATA_DIR has no marker that names its project'
+[[ -d "${SIMLEASE_DIR}/leases" && ! -e "${OVERRIDE_ROOT}/leases" ]] || fail 'SIMLEASE_DERIVED_DATA_DIR moved more than DerivedData'
+
+# A folder that cannot be created or written never fails the lease: the lease
+# warns and uses the default location.
+: > "${TEST_ROOT}/a file"
+[[ "$(leased_derived_data_path "$BOOT_PROJECT" "${TEST_ROOT}/a file/derived")" == "${DEFAULT_DERIVED_ROOT}/$(derived_key "$BOOT_PROJECT")/${UDID_A}" ]] \
+    || fail 'an unusable SIMLEASE_DERIVED_DATA_DIR did not fall back to the default location'
+grep -q 'cannot write DerivedData' "${TEST_ROOT}/derived.err" || fail 'an unusable SIMLEASE_DERIVED_DATA_DIR gave no warning'
+[[ "$(leased_derived_data_path "$BOOT_PROJECT" 'relative/derived')" == "${DEFAULT_DERIVED_ROOT}/$(derived_key "$BOOT_PROJECT")/${UDID_A}" ]] \
+    || fail 'a relative SIMLEASE_DERIVED_DATA_DIR did not fall back to the default location'
+grep -q 'must be an absolute path' "${TEST_ROOT}/derived.err" || fail 'a relative SIMLEASE_DERIVED_DATA_DIR gave no warning'
+hdiutil detach -quiet "$TEST_VOLUME" || hdiutil detach -quiet -force "$TEST_VOLUME"
+hdiutil attach -quiet -nobrowse -readonly -mountpoint "$TEST_VOLUME" "${TEST_ROOT}/volume.dmg"
+# "app one" already has a folder on the volume and "app two" has none; neither
+# can be written now.
+for READ_ONLY_PROJECT in "$VOLUME_PROJECT" "$VOLUME_PROJECT_TWO"; do
+    [[ "$(leased_derived_data_path "$READ_ONLY_PROJECT")" == "${DEFAULT_DERIVED_ROOT}/$(derived_key "$READ_ONLY_PROJECT")/${UDID_A}" ]] \
+        || fail 'a read-only volume did not fall back to the default DerivedData location'
+    grep -qF "cannot write DerivedData to ${VOLUME_DERIVED_ROOT}" "${TEST_ROOT}/derived.err" || fail 'a read-only volume gave no DerivedData warning'
+done
+hdiutil detach -quiet "$TEST_VOLUME" || hdiutil detach -quiet -force "$TEST_VOLUME"
+TEST_VOLUME=""
+
+# prune lists the folders of projects that are gone and deletes them only with
+# --delete. It leaves alone the folder of a project that exists, a folder an
+# active lease points into, a folder whose project may sit on a volume that is
+# not mounted, and a folder without a marker of its own.
+GONE_PROJECT="${TEST_ROOT}/worktrees/gone"
+LEASED_PROJECT="${TEST_ROOT}/worktrees/leased"
+GONE_DIR="${OVERRIDE_ROOT}/$(derived_key "$GONE_PROJECT")"
+LEASED_DIR="${OVERRIDE_ROOT}/$(derived_key "$LEASED_PROJECT")"
+UNMARKED_DIR="${OVERRIDE_ROOT}/0123456789ab"
+FOREIGN_DIR="${OVERRIDE_ROOT}/aaaaaaaaaaaa"
+mkdir -p "$GONE_PROJECT" "$LEASED_PROJECT" "$UNMARKED_DIR" "$FOREIGN_DIR"
+jq -n --arg project "${TEST_ROOT}/worktrees/other" '{project:$project}' > "${FOREIGN_DIR}/simlease-project.json"
+leased_derived_data_path "$GONE_PROJECT" "$OVERRIDE_ROOT" >/dev/null
+mkdir -p "${GONE_DIR}/${UDID_A}/Build"
+LEASE_A="$(SIMLEASE_WORKSPACE="$LEASED_PROJECT" SIMLEASE_DERIVED_DATA_DIR="$OVERRIDE_ROOT" "$LEASE_TOOL" acquire --device "$UDID_A" --owner derived-leased --ttl 30 --json)"
+TOKEN_A="$(jq -r '.token' <<<"$LEASE_A")"
+rm -rf "$GONE_PROJECT" "$LEASED_PROJECT"
+PRUNE_OUTPUT="$(SIMLEASE_DERIVED_DATA_DIR="$OVERRIDE_ROOT" "$LEASE_TOOL" prune)"
+[[ "$(prune_state "$PRUNE_OUTPUT" "$GONE_PROJECT")" == 'stale' ]] || fail 'prune did not list the folder of a project that is gone'
+[[ -d "${GONE_DIR}/${UDID_A}/Build" ]] || fail 'prune without --delete deleted a folder'
+PRUNE_OUTPUT="$("$LEASE_TOOL" prune --dir "$OVERRIDE_ROOT" --delete)"
+[[ "$(prune_state "$PRUNE_OUTPUT" "$GONE_PROJECT")" == 'deleted' && ! -e "$GONE_DIR" ]] || fail 'prune --delete did not delete the folder of a project that is gone'
+[[ "$(prune_state "$PRUNE_OUTPUT" "$LEASED_PROJECT")" == 'leased' && -d "$LEASED_DIR" ]] || fail 'prune --delete touched a folder under an active lease'
+[[ "$(prune_state "$PRUNE_OUTPUT" "$BOOT_PROJECT")" == 'in-use' && -d "${OVERRIDE_ROOT}/$(derived_key "$BOOT_PROJECT")" ]] \
+    || fail 'prune --delete touched the folder of a project that exists'
+[[ "$(prune_state "$PRUNE_OUTPUT" "$VOLUME_PROJECT")" == 'unknown' && -d "${OVERRIDE_ROOT}/${VOLUME_KEY}" ]] \
+    || fail 'prune --delete touched the folder of a project on a volume that is not mounted'
+[[ -d "$UNMARKED_DIR" && -d "$FOREIGN_DIR" ]] || fail 'prune --delete touched a folder without a marker of its own'
+"$LEASE_TOOL" release --token "$TOKEN_A" >/dev/null
+TOKEN_A=""
+[[ "$(prune_state "$("$LEASE_TOOL" prune --dir "$OVERRIDE_ROOT")" "$LEASED_PROJECT")" == 'stale' ]] \
+    || fail 'prune did not list a released folder whose project is gone'
 
 # Android: every lease boots its own emulator instance on a free port.
 export SIMLEASE_ANDROID_TEST_STATE_DIR="${TEST_ROOT}/android"

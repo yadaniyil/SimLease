@@ -16,7 +16,7 @@ Run several coding agents on one Mac: Claude Code, Codex, or anything that can r
 
 SimLease is one Bash CLI plus an optional guard hook. It uses macOS `lockf` kernel locks as the source of truth, keeps human-readable JSON lease metadata, and needs no database, daemon or MCP server.
 
-- **iOS Simulators.** Every lease gets one Simulator to itself, with its own Derived Data path. Busy pool? SimLease boots another Simulator when memory allows.
+- **iOS Simulators.** Every lease gets one Simulator to itself, with its own Derived Data path, on the project's own disk when the project is on an external one. Busy pool? SimLease boots another Simulator when memory allows.
 - **Slim Simulators.** With [simslim](https://github.com/mobai-app/simslim) installed, every leased Simulator is trimmed to the services apps need: about 0.9 GB instead of 4 GB, so twice as many fit.
 - **Android emulators.** Every lease boots its own instance of an AVD on a free port. Instances run read-only by default, so many agents can share one AVD without changing it.
 - **Guard hooks.** Claude Code and Codex hooks block device commands that don't hold a lease, and commands that would hit every agent's devices at once.
@@ -26,6 +26,7 @@ SimLease is one Bash CLI plus an optional guard hook. It uses macOS `lockf` kern
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Commands](#commands)
+- [Derived Data](#derived-data)
 - [Slim Simulators](#slim-simulators)
 - [Android emulators](#android-emulators)
 - [Guard hooks](#guard-hooks)
@@ -133,6 +134,7 @@ simlease status [--json]
 simlease renew   (--token TOKEN | --token-file PATH) [--ttl SECONDS] [--json]
 simlease release (--token TOKEN | --token-file PATH) [--json]
 simlease exec    (--token TOKEN | --token-file PATH) -- COMMAND [ARG ...]
+simlease prune   [--dir FOLDER] [--delete]                      old Derived Data on a volume
 ```
 
 Options for both platforms:
@@ -172,6 +174,32 @@ Emulator options:
 While the command runs, a background renewer extends the lease at a third of its TTL, so a long `flutter run` or test run keeps its device. The renewer stops when the command exits. Anything run outside `exec` keeps the device only until the TTL passes.
 
 `release` stops the device when SimLease booted it: always for emulators, and for Simulators that SimLease started. `status` lists every lease, its owner and expiry, and how much room is left.
+
+## Derived Data
+
+Every Simulator lease has its own `DERIVED_DATA_PATH`, so two agents never build into the same folder. Pass it to `xcodebuild -derivedDataPath`.
+
+| The project is on | `DERIVED_DATA_PATH` |
+| --- | --- |
+| The boot volume | `${TMPDIR}/simlease/derived-data/<key>/<UDID>` |
+| Another volume, such as an external disk | `<volume>/simlease-derived-data/<key>/<UDID>` |
+
+`<key>` is the first 12 characters of the SHA-256 of the folder `acquire` ran in, so every project, worktree and subfolder has its own. The path is fixed when the lease is acquired.
+
+A project on an external disk keeps its Derived Data on that disk, off the internal one. SimLease works the volume out from the project folder, by device number, so any volume name works. If the folder on the volume can't be created or written (a read-only disk, for example), the lease still succeeds: it prints a warning and uses the default location.
+
+`SIMLEASE_DERIVED_DATA_DIR=/absolute/folder` puts every project's Derived Data under that folder instead, as `<key>/<UDID>`. It moves nothing else: locks and leases stay in `SIMLEASE_DIR`, so leasing keeps working while an external disk is unplugged.
+
+macOS empties `${TMPDIR}` by itself. Nothing empties a volume, and SimLease never deletes Derived Data on its own. Each `<key>` folder on a volume, or under `SIMLEASE_DERIVED_DATA_DIR`, holds a `simlease-project.json` that names its project. `prune` reads it:
+
+```bash
+simlease prune                                                     # the current folder's volume; lists only
+simlease prune --dir /Volumes/Work/simlease-derived-data --delete
+```
+
+`prune` prints one line per folder: `stale` (the project folder is gone), `in-use` (it exists), `leased` (a lease points into it) or `unknown` (the project's parent folder is missing too: it moved, or its volume isn't mounted). Only `stale` folders are deleted, and only with `--delete`, which reports them as `deleted`. A folder without its own `simlease-project.json` is never touched.
+
+Only builds that are given `DERIVED_DATA_PATH` use it. `flutter run`, Xcode and MCP build tools pick their own build folders unless you pass them the path.
 
 ## Slim Simulators
 
@@ -297,6 +325,7 @@ A previously started `serve-sim` helper doesn't reserve its Simulator. `status` 
 | `SIMLEASE_ANDROID_AVD` | none | AVD used when `--android` has no `--avd`. |
 | `SIMLEASE_ANDROID_FIRST_PORT` / `_LAST_PORT` | 5560 / 5680 | Emulator console port range. |
 | `SIMLEASE_DIR` | `${TMPDIR}/simlease` | Shared state. Every cooperating process must use the same one. |
+| `SIMLEASE_DERIVED_DATA_DIR` | unset | An absolute folder for every project's [Derived Data](#derived-data). Moves nothing else. |
 | `SIMLEASE_CONFIG_DIR` | `~/.config/simlease` | Where the profile and pinned list live. |
 
 ## Requirements

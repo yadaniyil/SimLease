@@ -41,6 +41,7 @@ simlease exec --token-file "<scratch>/emu.token" -- adb logcat -d
 ```
 
 - **Quote the variables.** Put commands that use `$SIMULATOR_UDID`, `$DERIVED_DATA_PATH` or `$ANDROID_SERIAL` inside single-quoted `sh -c '…'`. Unquoted, the calling shell expands them to nothing before the lease sets them.
+- **Build into the lease's Derived Data.** Pass `$DERIVED_DATA_PATH` as given, and never hard-code it: for a project on an external disk it is on that disk (`<volume>/simlease-derived-data/…`), so builds don't fill the internal one. `simlease prune` lists old folders there; it deletes nothing without `--delete`.
 - **Stay on your device.** Use only the leased UDID or serial. Never `booted`, a device name, a hard-coded UDID, emulator-5554, or automatic device selection.
 - **Long runs are fine.** `exec` keeps the lease alive while its command runs. Anything run outside `exec` keeps the device only until the TTL passes; then SimLease stops the device.
 - **MCP tools.** For XcodeBuildMCP or another Simulator tool, pass the leased UDID in every call.

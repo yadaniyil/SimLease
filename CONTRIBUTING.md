@@ -16,7 +16,7 @@ shellcheck bin/simlease scripts/install.sh plugins/simlease/skills/simlease/scri
 ./tests/simlease-tests.sh
 ```
 
-The lease tests run against fake Simulators (`SIMLEASE_DEVICES`), fake emulators (`SIMLEASE_ANDROID_TEST_STATE_DIR`, `SIMLEASE_ANDROID_AVDS`) and a fake simslim (`SIMLEASE_SIMSLIM_BIN`). They use a temporary lease directory and config directory, so they never touch real devices, your leases, or your `~/.config/simlease` files.
+The lease tests run against fake Simulators (`SIMLEASE_DEVICES`), fake emulators (`SIMLEASE_ANDROID_TEST_STATE_DIR`, `SIMLEASE_ANDROID_AVDS`) and a fake simslim (`SIMLEASE_SIMSLIM_BIN`). They use a temporary lease directory and config directory, so they never touch real devices, your leases, or your `~/.config/simlease` files. The Derived Data tests need a second volume: they create a 4 MB disk image with `hdiutil`, mount it inside the temporary folder, and detach it when they finish.
 
 A change to booting, slimming or stopping devices also needs one run on real devices. Lease a spare Simulator with `--device`, and an emulator with `--avd`, and describe the result in the pull request.
 
