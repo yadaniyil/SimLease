@@ -451,7 +451,9 @@ rm -f "${SIMLEASE_CONFIG_DIR}/pinned"
 
 # Android: every lease boots its own emulator instance on a free port.
 export SIMLEASE_ANDROID_TEST_STATE_DIR="${TEST_ROOT}/android"
-export SIMLEASE_ANDROID_AVDS=$'avd_shared\navd_signed_in'
+export SIMLEASE_ANDROID_AVDS=$'avd_shared\navd_signed_in\navd_old_name'
+# Keeps the Mac's real AVD folder out of the tests.
+export ANDROID_AVD_HOME="${TEST_ROOT}/avd-home"
 export SIMLEASE_MAX_EMULATORS=2
 AND_A="$("$LEASE_TOOL" acquire --avd avd_shared --owner and-a --ttl 30 --json)"
 TOKEN_A="$(jq -r '.token' <<<"$AND_A")"
@@ -491,7 +493,37 @@ SIMLEASE_TEST_ANDROID_BOOT_FAILS=true "$LEASE_TOOL" acquire --avd avd_shared --o
     >/dev/null 2>"${TEST_ROOT}/boot-fail.err" && fail 'a failed emulator boot returned a lease'
 grep -q 'did not boot' "${TEST_ROOT}/boot-fail.err" || fail 'a failed emulator boot was not reported'
 [[ $(( $(date +%s) - BOOT_STARTED )) -lt 20 ]] || fail 'a failed emulator boot kept retrying until --wait ran out'
+# One AVD folder can have two names: a second .ini with the same path=. A
+# writable lease waits for an instance started under either name.
+mkdir -p "${ANDROID_AVD_HOME}/avd_shared.avd" "${ANDROID_AVD_HOME}/avd_signed_in.avd"
+printf 'avd.ini.encoding=UTF-8\npath=%s\npath.rel=avd/avd_shared.avd\n' "${ANDROID_AVD_HOME}/avd_shared.avd" \
+    | tee "${ANDROID_AVD_HOME}/avd_shared.ini" > "${ANDROID_AVD_HOME}/avd_old_name.ini"
+printf 'avd.ini.encoding=UTF-8\npath=%s\npath.rel=avd/avd_signed_in.avd\n' "${ANDROID_AVD_HOME}/avd_signed_in.avd" \
+    > "${ANDROID_AVD_HOME}/avd_signed_in.ini"
+AND_A="$("$LEASE_TOOL" acquire --avd avd_old_name --owner and-old --ttl 30 --json)"
+TOKEN_A="$(jq -r '.token' <<<"$AND_A")"
+"$LEASE_TOOL" acquire --avd avd_shared --writable --owner and-w --wait 1 --ttl 30 --json >/dev/null 2>"${TEST_ROOT}/alias.err" \
+    && fail 'a writable lease booted an AVD that was running under its other name'
+grep -q 'AVD avd_shared is running elsewhere as avd_old_name' "${TEST_ROOT}/alias.err" \
+    || fail 'a writable lease did not say which name the AVD runs under'
+AND_B="$("$LEASE_TOOL" acquire --avd avd_signed_in --writable --owner and-other --ttl 30 --json)"
+TOKEN_B="$(jq -r '.token' <<<"$AND_B")"
+[[ "$(jq -r '.writable' <<<"$AND_B")" == 'true' ]] || fail 'a writable lease waited for an AVD in another folder'
+"$LEASE_TOOL" release --token "$TOKEN_B" >/dev/null
+TOKEN_B=""
+"$LEASE_TOOL" release --token "$TOKEN_A" >/dev/null
+AND_A="$("$LEASE_TOOL" acquire --avd avd_shared --owner and-new --ttl 30 --json)"
+TOKEN_A="$(jq -r '.token' <<<"$AND_A")"
+if "$LEASE_TOOL" acquire --avd avd_old_name --writable --owner and-w --wait 1 --ttl 30 --json >/dev/null 2>&1; then
+    fail 'a writable lease under the old name booted an AVD that was running under the new name'
+fi
+"$LEASE_TOOL" release --token "$TOKEN_A" >/dev/null
+AND_A="$("$LEASE_TOOL" acquire --avd avd_old_name --writable --owner and-w --ttl 30 --json)"
+TOKEN_A="$(jq -r '.token' <<<"$AND_A")"
+[[ "$(jq -r '.writable' <<<"$AND_A")" == 'true' ]] || fail 'a writable lease still waited after the other name stopped'
+"$LEASE_TOOL" release --token "$TOKEN_A" >/dev/null
+TOKEN_A=""
 [[ -z "$(ls "$SIMLEASE_ANDROID_TEST_STATE_DIR")" ]] || fail 'emulators are still running after the Android tests'
-unset SIMLEASE_ANDROID_TEST_STATE_DIR SIMLEASE_ANDROID_AVDS SIMLEASE_MAX_EMULATORS
+unset SIMLEASE_ANDROID_TEST_STATE_DIR SIMLEASE_ANDROID_AVDS SIMLEASE_MAX_EMULATORS ANDROID_AVD_HOME
 
 printf 'simulator lease tests passed\n'

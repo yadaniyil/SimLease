@@ -203,7 +203,7 @@ simlease exec --token-file /tmp/agent-one.sim -- sh -c 'simslim doctor "$SIMULAT
 `simlease acquire --avd NAME` boots a new instance of the AVD for this lease.
 
 - **Ports.** Each lease gets a free even console port from 5560. The emulator also uses the port above it for adb and port+3000 for gRPC. Ports in use by emulators that SimLease didn't start are skipped.
-- **Read-only by default.** Many leases can run the same AVD at once, and none of them changes it. `--writable` is for changing the AVD itself, for example signing in an account; it waits until no other instance of that AVD runs.
+- **Read-only by default.** Many leases can run the same AVD at once, and none of them changes it. `--writable` is for changing the AVD itself, for example signing in an account; it waits until no other instance of that AVD runs. Two names for one AVD folder (two `.ini` files with the same `path=`) count as one AVD.
 - **Headless.** No window unless `--window`.
 - **Boots.** A boot waits for `sys.boot_completed` (up to 7 minutes, `SIMLEASE_ANDROID_BOOT_TIMEOUT_SECONDS`). A failed boot fails the acquire at once, with the last lines of the emulator log.
 - **Separate pool lock.** Emulator boots are serialized under their own pool lock, so a slow boot never delays a Simulator lease. The cap is `SIMLEASE_MAX_EMULATORS` (4 at 64 GB of RAM).

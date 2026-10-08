@@ -69,7 +69,7 @@ Emulator options:
   --avd NAME         The AVD to boot (implies --android; default SIMLEASE_ANDROID_AVD).
   --writable         Boot the AVD writable (default read-only, which lets many
                      leases share one AVD and never changes it). Waits until no
-                     other instance of that AVD runs.
+                     other instance of that AVD runs, under any of its names.
   --window           Show the emulator window (default headless).
   --emulator-args A  Extra emulator flags, e.g. "-camera-back emulated -gpu swiftshader_indirect".
 
@@ -263,15 +263,52 @@ android_running_count() {
     "$(android_tool adb)" devices 2>/dev/null | awk '$1 ~ /^emulator-/ {count++} END {print count+0}'
 }
 
-# An AVD runs writable in one instance at most, and only when no instance runs.
-android_avd_is_running() {
+# The AVD folder an .ini file points at (its path= line), or nothing.
+android_avd_ini_folder() {
+    local folder
+    folder="$(sed -n 's/^path=//p' "$1" 2>/dev/null | head -n 1 || true)"
+    folder="${folder%/}"
+    [[ -n "$folder" ]] || return 0
+    # The real folder when it exists, so a symlinked path still matches.
+    (cd "$folder" 2>/dev/null && pwd -P) || printf '%s\n' "$folder"
+}
+
+# Every name of an AVD, the given one first. A second .ini with the same path=
+# gives an AVD folder a second name, and the emulator boots it under either.
+android_avd_names() {
     local avd="$1"
-    if [[ -n "${SIMLEASE_ANDROID_TEST_STATE_DIR:-}" ]]; then
-        grep -qx -- "$avd" "${SIMLEASE_ANDROID_TEST_STATE_DIR}"/*.running 2>/dev/null
-        return
-    fi
-    pgrep -f -- "qemu-system.* -avd ${avd}( |$)" >/dev/null 2>&1 \
-        || pgrep -f -- "emulator.* -avd ${avd}( |$)" >/dev/null 2>&1
+    local avd_home="${ANDROID_AVD_HOME:-${HOME}/.android/avd}"
+    local folder
+    local ini
+    printf '%s\n' "$avd"
+    folder="$(android_avd_ini_folder "${avd_home}/${avd}.ini")"
+    [[ -n "$folder" ]] || return 0
+    for ini in "$avd_home"/*.ini; do
+        [[ -f "$ini" && "$ini" != "${avd_home}/${avd}.ini" ]] || continue
+        [[ "$(android_avd_ini_folder "$ini")" != "$folder" ]] || basename "$ini" .ini
+    done
+}
+
+# Prints the name a running instance of the AVD was started under, if one runs.
+android_avd_running_as() {
+    local name
+    while IFS= read -r name; do
+        if [[ -n "${SIMLEASE_ANDROID_TEST_STATE_DIR:-}" ]]; then
+            grep -qx -- "$name" "${SIMLEASE_ANDROID_TEST_STATE_DIR}"/*.running 2>/dev/null || continue
+        else
+            pgrep -f -- "qemu-system.* -avd ${name}( |$)" >/dev/null 2>&1 \
+                || pgrep -f -- "emulator.* -avd ${name}( |$)" >/dev/null 2>&1 || continue
+        fi
+        printf '%s\n' "$name"
+        return 0
+    done < <(android_avd_names "$1")
+    return 1
+}
+
+# An AVD runs writable in one instance at most, and only when no instance runs
+# under any of its names.
+android_avd_is_running() {
+    android_avd_running_as "$1" >/dev/null
 }
 
 android_boot() {
@@ -1078,6 +1115,7 @@ acquire_android_lease() {
     local started_at
     local status
     local reported=false
+    local running_as
 
     [[ -n "$avd" ]] || avd="${SIMLEASE_ANDROID_AVD:-}"
     [[ -n "$avd" ]] || fail "--android needs --avd NAME (or SIMLEASE_ANDROID_AVD). AVDs: $(android_avds | paste -sd ' ' -)"
@@ -1098,8 +1136,16 @@ acquire_android_lease() {
             case "$(jq -r '.reason' <<< "$(capacity_json android)")" in
                 emulator-limit) printf 'simlease: the emulator limit is reached; waiting for a lease\n' >&2 ;;
                 insufficient-free-memory) printf 'simlease: not enough free memory to boot an emulator; waiting for a lease\n' >&2 ;;
-                *) [[ "${SIMLEASE_ANDROID_WRITABLE:-false}" != "true" ]] \
-                    || printf 'simlease: AVD %s is running elsewhere; a writable lease waits for it\n' "$avd" >&2 ;;
+                *)
+                    if [[ "${SIMLEASE_ANDROID_WRITABLE:-false}" == "true" ]]; then
+                        running_as="$(android_avd_running_as "$avd" || true)"
+                        if [[ -n "$running_as" && "$running_as" != "$avd" ]]; then
+                            printf 'simlease: AVD %s is running elsewhere as %s (two names, one AVD folder); a writable lease waits for it\n' \
+                                "$avd" "$running_as" >&2
+                        else
+                            printf 'simlease: AVD %s is running elsewhere; a writable lease waits for it\n' "$avd" >&2
+                        fi
+                    fi ;;
             esac
             reported=true
         fi
