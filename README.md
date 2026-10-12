@@ -241,11 +241,11 @@ SimLease finds the SDK through `ANDROID_SDK_ROOT`, `ANDROID_HOME` or `~/Library/
 
 ## Guard hooks
 
-The guard is a `PreToolUse` hook shared by Claude Code and Codex. It reads each Bash command and each Simulator MCP tool call.
+The guard is a `PreToolUse` hook shared by Claude Code and Codex. It reads each Bash command and each Simulator MCP tool call. A command split over lines with a trailing `\` is read as one line.
 
 **Needs a lease.** These are blocked unless they run through `simlease exec`:
 - `xcrun simctl`
-- `xcodebuild` aimed at a Simulator
+- `xcodebuild` aimed at a Simulator: `iphonesimulator`, `platform=iOS Simulator`, or `-destination id=` with a Simulator UDID or a shell variable. A physical device's UDID passes.
 - `serve-sim`
 - `flutter` aimed at a Simulator UDID
 - emulator boots

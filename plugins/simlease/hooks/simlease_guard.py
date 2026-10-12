@@ -12,11 +12,19 @@ from pathlib import Path
 from typing import Any
 
 
+# A Simulator UDID is 8-4-4-4-12 hex. A physical device's is 8-16 hex or 40 hex,
+# so `xcodebuild -destination id=<physical UDID>` needs no lease. An id the guard
+# can't read (`id=$UDID`, `id=$(...)`) still counts as a Simulator.
+SIMULATOR_UDID = r"[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\b"
 SHELL_SIMULATOR_PATTERN = re.compile(
     r"(?:\bxcrun\s+simctl\b|\bxcodebuild\b[^\n]*(?:iphonesimulator|platform\s*=\s*iOS\s+Simulator|"
-    r"-destination\s+[^\n]*\bid\s*=)|\bserve-sim\b|\bopen\s+(?:-[^\s]+\s+)*-a\s+Simulator\b)",
+    r"-destination\s+[^\n]*\bid\s*=\s*[\"'\\]*(?:" + SIMULATOR_UDID + r"|[$`]))"
+    r"|\bserve-sim\b|\bopen\s+(?:-[^\s]+\s+)*-a\s+Simulator\b)",
     re.IGNORECASE,
 )
+# A backslash at the end of a line continues the command on the next line, so
+# the guard reads both as one line. An escaped backslash (`\\`) ends the line.
+LINE_CONTINUATION = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
 # `xcrun simctl list` and `xcrun simctl help` read nothing but state: no lease needed.
 READ_ONLY_SIMCTL_PATTERN = re.compile(r"\bxcrun\s+simctl\s+(?:list|help)\b", re.IGNORECASE)
 SIMLEASE_EXEC_PATTERN = re.compile(r"(?:^|[\s/'\"(])(?:simlease|scripts/simlease)\s+exec\s+--token\b")
@@ -229,7 +237,7 @@ def main() -> int:
     cwd = str(event.get("cwd", os.getcwd()))
 
     if tool_name == "Bash":
-        command = shell_command(tool_input)
+        command = LINE_CONTINUATION.sub(r"\1", shell_command(tool_input))
         command = blank_text_searches(READ_ONLY_SIMCTL_PATTERN.sub("simctl-read-only", command))
         for pattern, reason in SHARED_DEVICE_HAZARDS:
             match = pattern.search(command)

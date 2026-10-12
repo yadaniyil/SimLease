@@ -37,6 +37,8 @@ FLUTTER_ON_SIMULATOR = re.compile(
 )
 SIMLEASE_EXEC = re.compile(r"(?:^|[\s/'\"(])(?:simlease|scripts/simlease)\s+exec\s+--token\b")
 READ_ONLY_SIMCTL = re.compile(r"\bxcrun\s+simctl\s+(?:list|help)\b")
+# A backslash at the end of a line continues the command on the next line.
+LINE_CONTINUATION = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
 # Cheap prefilter: only commands that could touch a device go to the upstream guard.
 LOOKS_LIKE_DEVICE = re.compile(
     r"simctl|xcodebuild|serve-sim|Simulator|flutter|simslim|\badb\b|emulator|qemu|killall|pkill",
@@ -72,7 +74,7 @@ def main() -> int:
     tool_input = event.get("tool_input")
 
     if tool_name == "Bash" and isinstance(tool_input, dict):
-        command = str(tool_input.get("command", ""))
+        command = LINE_CONTINUATION.sub(r"\1", str(tool_input.get("command", "")))
         if not LOOKS_LIKE_DEVICE.search(command):
             return 0
         if not SIMLEASE_EXEC.search(command) and FLUTTER_ON_SIMULATOR.search(command):

@@ -9,6 +9,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 HOOK = ROOT / "plugins" / "simlease" / "hooks" / "simlease_guard.py"
 UDID = "11111111-1111-1111-1111-111111111111"
+# Physical device UDIDs: 8-16 hex, and the older 40 hex.
+PHONE = "00008140-0004496C2288801C"
+OLD_PHONE = "0123456789abcdef0123456789abcdef01234567"
 
 
 def invoke(tool_name: str, tool_input: object, cwd: Path, lease_root: Path) -> dict:
@@ -170,6 +173,54 @@ def main() -> None:
             f"xcrun simctl list devices -j; xcrun simctl boot {UDID}",
         ):
             assert bash_denied(command), command
+
+        # xcodebuild aimed at a Simulator needs a lease; a physical device (8-16 or 40 hex UDID) doesn't.
+        for command in (
+            f"xcodebuild -project X.xcodeproj -scheme X -destination 'id={UDID}' build",
+            f"xcodebuild -scheme X -destination id={UDID.lower()} test",
+            f'xcodebuild -scheme X -destination "platform=iOS Simulator,id={UDID}" build',
+            "xcodebuild -scheme X -destination 'platform=iOS Simulator,name=iPhone 17' build",
+            "xcodebuild -scheme X -sdk iphonesimulator build",
+            'xcodebuild -scheme X -destination "id=$SIMULATOR_UDID" build',
+            'xcodebuild -scheme X -destination "id=${UDID}" build',
+            "xcodebuild -scheme X -destination id=$(pick-a-device) build",
+            f"xcodebuild -scheme X -destination 'id={PHONE}' -destination 'id={UDID}' test",
+        ):
+            assert bash_denied(command), command
+        for command in (
+            f"xcodebuild -project X.xcodeproj -scheme X -destination 'id={PHONE}' build",
+            f"xcodebuild -scheme X -destination id={PHONE.lower()} build",
+            f'xcodebuild -scheme X -destination "platform=iOS,id={PHONE}" build',
+            f"xcodebuild -scheme X -destination 'id={OLD_PHONE}' build",
+            "xcodebuild -scheme X -destination 'platform=iOS,name=My iPhone' build",
+            "xcodebuild -scheme X -destination 'generic/platform=iOS' archive",
+            f"simlease exec --token abc -- xcodebuild -scheme X -destination 'id={UDID}' test",
+        ):
+            assert not bash_denied(command), command
+
+        # A command split over lines with a trailing backslash is read as one line.
+        for command in (
+            f"xcodebuild -scheme X \\\n  -destination 'id={UDID}' build",
+            "xcodebuild -scheme X \\\n  -destination 'platform=iOS Simulator,name=iPhone 17' build",
+            "xcodebuild -scheme X \\\n  -sdk \\\n  iphonesimulator build",
+            f"xcodebuild -scheme X -destination \\\n  'id={PHONE}' -destination \\\n  'id={UDID}' test",
+            "adb \\\n  -s emulator-5560 install app.apk",
+            f"xcrun simctl \\\n  boot {UDID}",
+        ):
+            assert bash_denied(command), command
+        for command in (
+            f"xcodebuild -scheme X \\\n  -destination 'id={PHONE}' build",
+            f"xcodebuild -scheme X \\\n  -destination 'id={OLD_PHONE}' \\\n  build",
+            "adb \\\n  -s R58N12ABCDE install app.apk",
+            "xcrun simctl \\\n  list devices -j",
+            'grep -rn "xcrun simctl" \\\n  .',
+            f"simlease exec --token abc -- \\\n  xcodebuild -scheme X \\\n  -destination 'id={UDID}' test",
+            # A later command on its own line stays a separate command.
+            f"xcodebuild -scheme X -destination 'id={PHONE}' build\necho iphonesimulator",
+            # An escaped backslash does not continue the line.
+            f"xcodebuild -scheme X -destination 'id={PHONE}' build; echo a\\\\\necho iphonesimulator",
+        ):
+            assert not bash_denied(command), command
 
         # Text searches may mention device commands; a device command next to one is still caught.
         for command in (

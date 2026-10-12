@@ -28,6 +28,13 @@ def main() -> None:
         assert bash(f"flutter run -d {SIM}")
         assert not bash(f"simlease exec --token-file t -- flutter run -d {SIM}")
         assert not bash("xcrun simctl list devices booted")
+        assert bash(f"xcodebuild -scheme X -destination 'id={SIM}' build")
+        assert not bash("xcodebuild -scheme X -destination 'id=00008140-0004496C2288801C' build")
+        # A command split over lines with a trailing backslash is read as one line.
+        assert bash(f"xcodebuild -scheme X \\\n  -destination 'id={SIM}' build")
+        assert not bash("xcodebuild -scheme X \\\n  -destination 'id=00008140-0004496C2288801C' build")
+        assert bash(f"flutter run \\\n  -d {SIM}")
+        assert not bash(f"simlease exec --token-file t -- \\\n  flutter run -d {SIM}")
         assert bash("adb -s emulator-5560 shell getprop")
         assert not bash("simlease exec --token-file t -- adb shell getprop")
         assert bash("simlease exec --token-file t -- xcrun simctl shutdown all")
