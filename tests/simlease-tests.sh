@@ -13,7 +13,10 @@ export SIMLEASE_CONFIG_DIR="${TEST_ROOT}/config"
 # A checkout on an external volume would get DerivedData folders on that volume:
 # the tests lease from a workspace inside the test folder instead.
 export SIMLEASE_WORKSPACE="${TEST_ROOT}/workspace"
-unset SIMLEASE_DERIVED_DATA_DIR
+unset SIMLEASE_DERIVED_DATA_DIR SIMLEASE_DERIVED_DATA_MAX_AGE SIMLEASE_DERIVED_DATA_MAX_TOTAL
+unset SIMLEASE_DERIVED_DATA_KEEP_RECENT SIMLEASE_AUTO_PRUNE_INTERVAL
+# acquire and release start a background prune; only the prune tests turn it on.
+export SIMLEASE_AUTO_PRUNE=0
 mkdir -p "$SIMLEASE_SERVE_SIM_STATE_DIR" "$SIMLEASE_WORKSPACE"
 
 # macOS /bin/bash 3.2 ignores `set -e` when `[[ ... ]]` fails, so every
@@ -478,9 +481,19 @@ leased_derived_data_path() {
     [[ "$path" == "$(jq -r '.derivedDataPath' <<<"$lease")" ]] || fail 'exec and acquire disagree on the DerivedData path'
     printf '%s\n' "$path"
 }
-# The state `prune` printed for a project.
+# What `prune` printed for the folder whose path ends in $2, as state/reason
+# (deleted/old, kept/leased, would-delete/empty ...), or nothing.
 prune_state() {
-    awk -F '\t' -v project="$2" '$3 == project { print $1 }' <<<"$1"
+    SUFFIX="$2" awk -F '\t' '
+        { start = length($5) - length(ENVIRON["SUFFIX"]) + 1 }
+        start >= 1 && substr($5, start) == ENVIRON["SUFFIX"] { print $1 "/" $2 }' <<<"$1"
+}
+# A fake DerivedData device folder: $2 KB of data, every part of it last
+# changed $3 hours ago.
+fake_derived_data() {
+    mkdir -p "$1/Build/Products"
+    dd if=/dev/zero of="$1/Build/Products/App.bin" bs=1024 count="$2" 2>/dev/null
+    find "$1" -exec touch -t "$(date -v-"$3"H '+%Y%m%d%H%M.%S')" {} +
 }
 DEFAULT_DERIVED_ROOT="${SIMLEASE_DIR}/derived-data"
 BOOT_PROJECT="${TEST_ROOT}/boot project"
@@ -492,7 +505,8 @@ mkdir -p "$BOOT_PROJECT"
 [[ ! -e "${DEFAULT_DERIVED_ROOT}/$(derived_key "$BOOT_PROJECT")" ]] || fail 'the default DerivedData location got a folder it never had before'
 [[ "$(leased_derived_data_path "$MISSING_PROJECT")" == "${DEFAULT_DERIVED_ROOT}/$(derived_key "$MISSING_PROJECT")/${UDID_A}" ]] \
     || fail 'a workspace that does not exist did not get the default DerivedData path'
-"$LEASE_TOOL" prune >/dev/null 2>&1 && fail 'prune on the boot volume did not ask for --dir'
+grep -qF "in $(cd "$DEFAULT_DERIVED_ROOT" && pwd -P);" <<<"$("$LEASE_TOOL" prune --dry-run)" \
+    || fail 'prune did not look at the default DerivedData folder'
 
 TEST_VOLUME="${TEST_ROOT}/ext vol"
 mkdir -p "$TEST_VOLUME"
@@ -511,8 +525,11 @@ VOLUME_KEY="$(derived_key "$VOLUME_PROJECT")"
     || fail 'the DerivedData folder on the volume has no marker that names its project'
 [[ "$(leased_derived_data_path "${VOLUME_PROJECT}/ios")" == "${VOLUME_DERIVED_ROOT}/$(derived_key "${VOLUME_PROJECT}/ios")/${UDID_A}" ]] \
     || fail 'a subfolder of a project on another volume did not use the folder at the volume root'
-[[ "$(prune_state "$(SIMLEASE_WORKSPACE="$VOLUME_PROJECT" "$LEASE_TOOL" prune)" "$VOLUME_PROJECT")" == 'in-use' ]] \
-    || fail 'prune did not find the DerivedData folder of the current volume'
+grep -qF "in ${VOLUME_DERIVED_ROOT};" <<<"$(SIMLEASE_WORKSPACE="$VOLUME_PROJECT" "$LEASE_TOOL" prune --dry-run)" \
+    || fail 'prune did not look at the DerivedData folder of the current volume'
+# A lease remembers the folder, so a sweep started from any project looks there.
+grep -qF "in ${VOLUME_DERIVED_ROOT};" <<<"$("$LEASE_TOOL" prune --dry-run)" \
+    || fail 'prune did not look at the DerivedData folder of a volume a lease used before'
 # An emulator lease has no DerivedData: nothing of it lands on the volume.
 (
     export SIMLEASE_ANDROID_TEST_STATE_DIR="${TEST_ROOT}/android-derived"
@@ -558,38 +575,190 @@ done
 hdiutil detach -quiet "$TEST_VOLUME" || hdiutil detach -quiet -force "$TEST_VOLUME"
 TEST_VOLUME=""
 
-# prune lists the folders of projects that are gone and deletes them only with
-# --delete. It leaves alone the folder of a project that exists, a folder an
-# active lease points into, a folder whose project may sit on a volume that is
-# not mounted, and a folder without a marker of its own.
+# prune in a folder outside the lease directory: only <key> folders whose
+# marker names their project count. A folder whose project is gone goes once it
+# is 2 h old. One whose project exists, or may sit on a volume that is not
+# mounted, stays until it is 24 h old. A leased folder always stays.
 GONE_PROJECT="${TEST_ROOT}/worktrees/gone"
 LEASED_PROJECT="${TEST_ROOT}/worktrees/leased"
-GONE_DIR="${OVERRIDE_ROOT}/$(derived_key "$GONE_PROJECT")"
-LEASED_DIR="${OVERRIDE_ROOT}/$(derived_key "$LEASED_PROJECT")"
+GONE_KEY="$(derived_key "$GONE_PROJECT")"
+LEASED_KEY="$(derived_key "$LEASED_PROJECT")"
+BOOT_KEY="$(derived_key "$BOOT_PROJECT")"
 UNMARKED_DIR="${OVERRIDE_ROOT}/0123456789ab"
 FOREIGN_DIR="${OVERRIDE_ROOT}/aaaaaaaaaaaa"
-mkdir -p "$GONE_PROJECT" "$LEASED_PROJECT" "$UNMARKED_DIR" "$FOREIGN_DIR"
+mkdir -p "$GONE_PROJECT" "$LEASED_PROJECT" "$FOREIGN_DIR"
 jq -n --arg project "${TEST_ROOT}/worktrees/other" '{project:$project}' > "${FOREIGN_DIR}/simlease-project.json"
 leased_derived_data_path "$GONE_PROJECT" "$OVERRIDE_ROOT" >/dev/null
-mkdir -p "${GONE_DIR}/${UDID_A}/Build"
+fake_derived_data "${OVERRIDE_ROOT}/${GONE_KEY}/${UDID_A}" 64 3
+fake_derived_data "${OVERRIDE_ROOT}/${BOOT_KEY}/${UDID_A}" 64 3
+fake_derived_data "${OVERRIDE_ROOT}/${VOLUME_KEY}/${UDID_A}" 64 3
+fake_derived_data "${UNMARKED_DIR}/${UDID_A}" 64 30
+fake_derived_data "${FOREIGN_DIR}/${UDID_A}" 64 30
 LEASE_A="$(SIMLEASE_WORKSPACE="$LEASED_PROJECT" SIMLEASE_DERIVED_DATA_DIR="$OVERRIDE_ROOT" "$LEASE_TOOL" acquire --device "$UDID_A" --owner derived-leased --ttl 30 --json)"
 TOKEN_A="$(jq -r '.token' <<<"$LEASE_A")"
+fake_derived_data "${OVERRIDE_ROOT}/${LEASED_KEY}/${UDID_A}" 64 48
 rm -rf "$GONE_PROJECT" "$LEASED_PROJECT"
-PRUNE_OUTPUT="$(SIMLEASE_DERIVED_DATA_DIR="$OVERRIDE_ROOT" "$LEASE_TOOL" prune)"
-[[ "$(prune_state "$PRUNE_OUTPUT" "$GONE_PROJECT")" == 'stale' ]] || fail 'prune did not list the folder of a project that is gone'
-[[ -d "${GONE_DIR}/${UDID_A}/Build" ]] || fail 'prune without --delete deleted a folder'
+PRUNE_OUTPUT="$("$LEASE_TOOL" prune --dry-run --dir "$OVERRIDE_ROOT")"
+[[ "$(prune_state "$PRUNE_OUTPUT" "/${GONE_KEY}/${UDID_A}")" == 'would-delete/project-gone' ]] \
+    || fail 'prune --dry-run did not list the folder of a project that is gone'
+[[ -d "${OVERRIDE_ROOT}/${GONE_KEY}/${UDID_A}/Build" ]] || fail 'prune --dry-run deleted a folder'
+grep -q 'Nothing was deleted' <<<"$PRUNE_OUTPUT" || fail 'prune --dry-run did not say that nothing was deleted'
+# --delete is what older versions needed; prune deletes without it now.
 PRUNE_OUTPUT="$("$LEASE_TOOL" prune --dir "$OVERRIDE_ROOT" --delete)"
-[[ "$(prune_state "$PRUNE_OUTPUT" "$GONE_PROJECT")" == 'deleted' && ! -e "$GONE_DIR" ]] || fail 'prune --delete did not delete the folder of a project that is gone'
-[[ "$(prune_state "$PRUNE_OUTPUT" "$LEASED_PROJECT")" == 'leased' && -d "$LEASED_DIR" ]] || fail 'prune --delete touched a folder under an active lease'
-[[ "$(prune_state "$PRUNE_OUTPUT" "$BOOT_PROJECT")" == 'in-use' && -d "${OVERRIDE_ROOT}/$(derived_key "$BOOT_PROJECT")" ]] \
-    || fail 'prune --delete touched the folder of a project that exists'
-[[ "$(prune_state "$PRUNE_OUTPUT" "$VOLUME_PROJECT")" == 'unknown' && -d "${OVERRIDE_ROOT}/${VOLUME_KEY}" ]] \
-    || fail 'prune --delete touched the folder of a project on a volume that is not mounted'
-[[ -d "$UNMARKED_DIR" && -d "$FOREIGN_DIR" ]] || fail 'prune --delete touched a folder without a marker of its own'
+[[ "$(prune_state "$PRUNE_OUTPUT" "/${GONE_KEY}/${UDID_A}")" == 'deleted/project-gone' ]] \
+    || fail 'prune did not delete the folder of a project that is gone'
+[[ "$(prune_state "$PRUNE_OUTPUT" "/${GONE_KEY}")" == 'deleted/empty' && ! -e "${OVERRIDE_ROOT}/${GONE_KEY}" ]] \
+    || fail 'prune did not remove the <key> folder it emptied'
+[[ "$(prune_state "$PRUNE_OUTPUT" "/${LEASED_KEY}/${UDID_A}")" == 'kept/leased' && -d "${OVERRIDE_ROOT}/${LEASED_KEY}/${UDID_A}" ]] \
+    || fail 'prune touched a folder under an active lease'
+[[ "$(prune_state "$PRUNE_OUTPUT" "/${BOOT_KEY}/${UDID_A}")" == 'kept/fits' ]] || fail 'prune deleted the folder of a project that exists'
+[[ "$(prune_state "$PRUNE_OUTPUT" "/${VOLUME_KEY}/${UDID_A}")" == 'kept/fits' ]] \
+    || fail 'prune deleted the folder of a project on a volume that is not mounted'
+[[ -d "${UNMARKED_DIR}/${UDID_A}" && -d "${FOREIGN_DIR}/${UDID_A}" ]] || fail 'prune touched a folder without a marker of its own'
+[[ -z "$(prune_state "$PRUNE_OUTPUT" "/0123456789ab/${UDID_A}")" ]] || fail 'prune listed a folder without a marker'
+[[ ! -e "${OVERRIDE_ROOT}/.simlease-trash" ]] || fail 'prune left its trash folder behind'
+# release marks the folder as used just now, though nothing in it changed for two days.
 "$LEASE_TOOL" release --token "$TOKEN_A" >/dev/null
 TOKEN_A=""
-[[ "$(prune_state "$("$LEASE_TOOL" prune --dir "$OVERRIDE_ROOT")" "$LEASED_PROJECT")" == 'stale' ]] \
-    || fail 'prune did not list a released folder whose project is gone'
+[[ "$(prune_state "$("$LEASE_TOOL" prune --dir "$OVERRIDE_ROOT")" "/${LEASED_KEY}/${UDID_A}")" == 'kept/recent' ]] \
+    || fail 'prune did not keep a folder whose lease was just released'
+
+# prune in the lease directory's own DerivedData folder, where every <key>
+# folder counts. Each device folder is judged by the newest change inside it.
+(
+    export SIMLEASE_DIR="${TEST_ROOT}/prune-leases"
+    export SIMLEASE_WORKSPACE="${TEST_ROOT}/prune-workspace"
+    mkdir -p "$SIMLEASE_WORKSPACE"
+    PRUNE_TOKEN=''
+    trap '[[ -z "$PRUNE_TOKEN" ]] || "$LEASE_TOOL" release --token "$PRUNE_TOKEN" >/dev/null 2>&1 || true' EXIT
+    PRUNE_LEASE="$("$LEASE_TOOL" acquire --device "$UDID_A" --owner prune-leased --ttl 60 --json)"
+    PRUNE_TOKEN="$(jq -r '.token' <<<"$PRUNE_LEASE")"
+    ROOT="$(cd "${SIMLEASE_DIR}/derived-data" && pwd -P)"
+    LEASED_FOLDER="$(jq -r '.derivedDataPath' <<<"$PRUNE_LEASE")"
+    LEASED_KEY="$(basename "$(dirname "$LEASED_FOLDER")")"
+    fake_derived_data "$LEASED_FOLDER" 1024 48
+    fake_derived_data "${ROOT}/aaaaaaaaaaa1/${UDID_A}" 1024 30
+    fake_derived_data "${ROOT}/aaaaaaaaaaa2/${UDID_A}" 1024 1
+    # The folder itself and most of it are 30 h old; one file inside is new.
+    fake_derived_data "${ROOT}/aaaaaaaaaaa3/${UDID_A}" 1024 30
+    touch "${ROOT}/aaaaaaaaaaa3/${UDID_A}/Build/Products/App.bin"
+    fake_derived_data "${ROOT}/bbbbbbbbbbb1/${UDID_A}" 1024 5
+    fake_derived_data "${ROOT}/bbbbbbbbbbb2/${UDID_A}" 1024 4
+    fake_derived_data "${ROOT}/bbbbbbbbbbb3/${UDID_A}" 1024 3
+    mkdir -p "${ROOT}/ccccccccccc1" "${ROOT}/ccccccccccc2" "${ROOT}/ccccccccccc3/not-a-device"
+    find "${ROOT}/ccccccccccc1" "${ROOT}/ccccccccccc3" -exec touch -t "$(date -v-30H '+%Y%m%d%H%M.%S')" {} +
+
+    "$LEASE_TOOL" prune --older-than 1h >/dev/null 2>&1 && fail 'prune accepted --older-than below the 2 h it always keeps'
+    "$LEASE_TOOL" prune --max-total lots >/dev/null 2>&1 && fail 'prune accepted a size it cannot read'
+    "$LEASE_TOOL" prune --older-than 5x >/dev/null 2>&1 && fail 'prune accepted a duration it cannot read'
+
+    # 7 MB in 7 folders. With a cap of 5500K: the 30 h old folder goes, then
+    # the oldest of the rest (5 h) until 5 MB are left.
+    PRUNE_OUTPUT="$("$LEASE_TOOL" prune --dry-run --max-total 5500K)"
+    [[ "$(prune_state "$PRUNE_OUTPUT" "/aaaaaaaaaaa1/${UDID_A}")" == 'would-delete/old' ]] || fail 'prune --dry-run did not list a folder idle for 30 h'
+    [[ "$(prune_state "$PRUNE_OUTPUT" "/bbbbbbbbbbb1/${UDID_A}")" == 'would-delete/over-cap' ]] || fail 'prune --dry-run did not list the oldest folder over the cap'
+    [[ "$(prune_state "$PRUNE_OUTPUT" "/ccccccccccc1")" == 'would-delete/empty' ]] || fail 'prune --dry-run did not list an old empty <key> folder'
+    [[ -d "${ROOT}/aaaaaaaaaaa1/${UDID_A}" && -d "${ROOT}/bbbbbbbbbbb1/${UDID_A}" && -d "${ROOT}/ccccccccccc1" ]] \
+        || fail 'prune --dry-run deleted something'
+    PRUNE_OUTPUT="$("$LEASE_TOOL" prune --dry-run --older-than 4h)"
+    [[ "$(prune_state "$PRUNE_OUTPUT" "/bbbbbbbbbbb2/${UDID_A}")" == 'would-delete/old' \
+        && "$(prune_state "$PRUNE_OUTPUT" "/bbbbbbbbbbb3/${UDID_A}")" == 'kept/fits' ]] || fail '--older-than 4h did not split 4 h from 3 h'
+
+    # Two sweeps at once: the second waits for the first.
+    "$LEASE_TOOL" prune --dry-run > "${TEST_ROOT}/prune-one.out" &
+    PRUNE_ONE=$!
+    "$LEASE_TOOL" prune --dry-run > "${TEST_ROOT}/prune-two.out" || fail 'a prune failed while another one ran'
+    wait "$PRUNE_ONE" || fail 'a prune failed while another one ran'
+
+    PRUNE_OUTPUT="$("$LEASE_TOOL" prune --max-total 5500K)"
+    [[ "$(prune_state "$PRUNE_OUTPUT" "/aaaaaaaaaaa1/${UDID_A}")" == 'deleted/old' && ! -e "${ROOT}/aaaaaaaaaaa1" ]] \
+        || fail 'prune did not delete a folder idle for 30 h, and its <key> folder'
+    [[ "$(prune_state "$PRUNE_OUTPUT" "/bbbbbbbbbbb1/${UDID_A}")" == 'deleted/over-cap' && ! -e "${ROOT}/bbbbbbbbbbb1" ]] \
+        || fail 'prune did not delete the oldest folder over the cap'
+    [[ "$(prune_state "$PRUNE_OUTPUT" "/bbbbbbbbbbb2/${UDID_A}")" == 'kept/fits' && -d "${ROOT}/bbbbbbbbbbb2/${UDID_A}" ]] \
+        || fail 'prune deleted more than the cap needed'
+    [[ "$(prune_state "$PRUNE_OUTPUT" "/aaaaaaaaaaa2/${UDID_A}")" == 'kept/recent' ]] || fail 'prune did not keep a folder used 1 h ago'
+    [[ "$(prune_state "$PRUNE_OUTPUT" "/aaaaaaaaaaa3/${UDID_A}")" == 'kept/recent' ]] \
+        || fail 'prune judged a folder by its own mtime, not the newest file inside'
+    [[ "$(prune_state "$PRUNE_OUTPUT" "/${LEASED_KEY}/${UDID_A}")" == 'kept/leased' && -d "$LEASED_FOLDER" ]] \
+        || fail 'prune deleted a leased folder that is 48 h old'
+    [[ ! -e "${ROOT}/ccccccccccc1" && -d "${ROOT}/ccccccccccc2" ]] || fail 'prune did not remove only the old empty <key> folder'
+    [[ -d "${ROOT}/ccccccccccc3/not-a-device" ]] || fail 'prune touched a folder that is not a device folder'
+    [[ ! -e "${ROOT}/.simlease-trash" ]] || fail 'prune left its trash folder behind'
+
+    # status shows what the last sweep measured: 5 folders of 1 MB are left.
+    STATUS="$("$LEASE_TOOL" status --json)"
+    [[ "$(jq -r --arg root "$ROOT" '.derivedData.roots[] | select(.path == $root) | .folders' <<<"$STATUS")" == '5' ]] \
+        || fail 'status does not show how many DerivedData folders are left'
+    [[ "$(jq -r --arg root "$ROOT" '.derivedData.roots[] | select(.path == $root) | .totalKB' <<<"$STATUS")" -ge 5120 ]] \
+        || fail 'status does not show the DerivedData size'
+    "$LEASE_TOOL" status | grep -qF "DerivedData: 5.0M in 5 folder(s) at ${ROOT}" || fail 'status text does not show the DerivedData size'
+
+    # A cap of 0 deletes every folder that is neither leased nor recent.
+    PRUNE_OUTPUT="$("$LEASE_TOOL" prune --max-total 0)"
+    [[ ! -e "${ROOT}/bbbbbbbbbbb2" && ! -e "${ROOT}/bbbbbbbbbbb3" && -d "${ROOT}/aaaaaaaaaaa2/${UDID_A}" && -d "$LEASED_FOLDER" ]] \
+        || fail 'a cap of 0 did not delete exactly the folders that are neither leased nor recent'
+    grep -q 'Still over the cap' <<<"$PRUNE_OUTPUT" || fail 'prune did not say it is still over the cap'
+
+    # acquire and release start the same sweep in the background, at most once
+    # every SIMLEASE_AUTO_PRUNE_INTERVAL. It outlives the process group of the
+    # command that started it, as when an agent's tool call ends.
+    fake_derived_data "${ROOT}/ddddddddddd1/${UDID_A}" 64 30
+    python3 - "$LEASE_TOOL" "$PRUNE_TOKEN" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+lease_tool, token = sys.argv[1:]
+environment = os.environ | {"SIMLEASE_AUTO_PRUNE": "1", "SIMLEASE_AUTO_PRUNE_INTERVAL": "0"}
+release = subprocess.Popen(
+    [lease_tool, "release", "--token", token],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.PIPE,
+    text=True,
+    env=environment,
+    start_new_session=True,
+)
+_, stderr = release.communicate(timeout=30)
+if release.returncode != 0:
+    raise SystemExit(f"release failed: {stderr}")
+try:
+    os.killpg(release.pid, signal.SIGKILL)
+except ProcessLookupError:
+    pass
+PY
+    PRUNE_TOKEN=''
+    for _ in $(seq 1 60); do
+        [[ -e "${ROOT}/ddddddddddd1" ]] || break
+        sleep 0.5
+    done
+    [[ ! -e "${ROOT}/ddddddddddd1" ]] || fail 'release did not prune an old folder in the background'
+    grep -qE "^deleted.old.+/ddddddddddd1/${UDID_A}$" "${SIMLEASE_DIR}/derived-data-prune.log" \
+        || fail 'the background prune did not log what it deleted'
+    fake_derived_data "${ROOT}/ddddddddddd2/${UDID_A}" 64 30
+    SWEEPS="$(grep -c 'auto-prune' "${SIMLEASE_DIR}/derived-data-prune.log")"
+    PRUNE_TOKEN="$(SIMLEASE_AUTO_PRUNE=1 SIMLEASE_AUTO_PRUNE_INTERVAL=1h "$LEASE_TOOL" acquire --device "$UDID_A" --owner throttled --ttl 30 --json | jq -r '.token')"
+    SIMLEASE_AUTO_PRUNE=1 SIMLEASE_AUTO_PRUNE_INTERVAL=1h "$LEASE_TOOL" release --token "$PRUNE_TOKEN" >/dev/null
+    PRUNE_TOKEN="$(SIMLEASE_AUTO_PRUNE=0 SIMLEASE_AUTO_PRUNE_INTERVAL=0 "$LEASE_TOOL" acquire --device "$UDID_A" --owner auto-off --ttl 30 --json | jq -r '.token')"
+    "$LEASE_TOOL" release --token "$PRUNE_TOKEN" >/dev/null
+    PRUNE_TOKEN=''
+    sleep 3
+    [[ -d "${ROOT}/ddddddddddd2/${UDID_A}" ]] || fail 'a background prune ran within its interval, or with SIMLEASE_AUTO_PRUNE=0'
+    [[ "$(grep -c 'auto-prune' "${SIMLEASE_DIR}/derived-data-prune.log")" == "$SWEEPS" ]] || fail 'a background prune ran when it should not'
+    # A setting it cannot read skips the sweep and never fails the lease.
+    PRUNE_TOKEN="$(SIMLEASE_AUTO_PRUNE=1 SIMLEASE_AUTO_PRUNE_INTERVAL=0 SIMLEASE_DERIVED_DATA_MAX_TOTAL=lots \
+        "$LEASE_TOOL" acquire --device "$UDID_A" --owner bad-setting --ttl 30 --json | jq -r '.token')"
+    [[ -n "$PRUNE_TOKEN" && "$PRUNE_TOKEN" != 'null' ]] || fail 'a bad prune setting failed the acquire'
+    "$LEASE_TOOL" release --token "$PRUNE_TOKEN" >/dev/null
+    PRUNE_TOKEN=''
+    for _ in $(seq 1 20); do
+        ! grep -q 'auto-prune skipped' "${SIMLEASE_DIR}/derived-data-prune.log" || break
+        sleep 0.5
+    done
+    grep -q 'auto-prune skipped' "${SIMLEASE_DIR}/derived-data-prune.log" || fail 'a bad prune setting was not logged'
+    [[ -d "${ROOT}/ddddddddddd2/${UDID_A}" ]] || fail 'a sweep with a bad setting deleted something'
+)
 
 # Android: every lease boots its own emulator instance on a free port.
 export SIMLEASE_ANDROID_TEST_STATE_DIR="${TEST_ROOT}/android"

@@ -59,7 +59,7 @@ Never boot an emulator, or aim `adb` or `flutter` at one, outside a lease. Physi
 ## Tool-specific rules
 
 - For XcodeBuildMCP, set `simulatorId` to the leased UDID before every Simulator tool call. Use the returned `derivedDataPath` for builds when the tool supports it.
-- Use `$DERIVED_DATA_PATH` (`derivedDataPath` in the acquire output) as given, never a hard-coded path. For a project on an external disk it is on that disk, under `<volume>/simlease-derived-data/`, so builds stay off the internal disk.
+- Use `$DERIVED_DATA_PATH` (`derivedDataPath` in the acquire output) as given, never a hard-coded path. For a project on an external disk it is on that disk, under `<volume>/simlease-derived-data/`, so builds stay off the internal disk. SimLease deletes old Derived Data itself (unused for 24 h, or past 40 GB per disk, never a leased folder); `simlease prune --dry-run` lists what would go. Never delete these folders by hand: another agent may be building in one.
 - For `serve-sim`, use only the leased UDID. Reuse an existing helper when `serveSimAlreadyRunning` is true, and leave that inherited helper running during cleanup. Otherwise start one for that UDID, and stop only the helper started by the current task. Never stop a helper while another lease owns its Simulator.
 - Pinned Simulators (`~/.config/simlease/pinned`) hold a sign-in or seeded media. Lease one only with `--device <UDID>`, and only when the task needs that state.
 - Never run commands that hit every device, even inside a lease: `simctl … all`, `simctl … booted`, `killall Simulator`, `killall qemu-system…`, a `pkill` that doesn't name your port or serial, or `adb kill-server`.

@@ -16,7 +16,7 @@ Run several coding agents on one Mac: Claude Code, Codex, or anything that can r
 
 SimLease is one Bash CLI plus an optional guard hook. It uses macOS `lockf` kernel locks as the source of truth, keeps human-readable JSON lease metadata, and needs no database, daemon or MCP server.
 
-- **iOS Simulators.** Every lease gets one Simulator to itself, with its own Derived Data path, on the project's own disk when the project is on an external one. Busy pool? SimLease boots another Simulator when memory allows.
+- **iOS Simulators.** Every lease gets one Simulator to itself, with its own Derived Data path, on the project's own disk when the project is on an external one. Old Derived Data is deleted automatically. Busy pool? SimLease boots another Simulator when memory allows.
 - **Slim Simulators.** With [simslim](https://github.com/mobai-app/simslim) installed, every leased Simulator is trimmed to the services apps need: about 0.9 GB instead of 4 GB, so twice as many fit.
 - **Android emulators.** Every lease boots its own instance of an AVD on a free port. Instances run read-only by default, so many agents can share one AVD without changing it.
 - **Guard hooks.** Claude Code and Codex hooks block device commands that don't hold a lease, and commands that would hit every agent's devices at once.
@@ -134,7 +134,7 @@ simlease status [--json]
 simlease renew   (--token TOKEN | --token-file PATH) [--ttl SECONDS] [--json]
 simlease release (--token TOKEN | --token-file PATH) [--json]
 simlease exec    (--token TOKEN | --token-file PATH) -- COMMAND [ARG ...]
-simlease prune   [--dir FOLDER] [--delete]                      old Derived Data on a volume
+simlease prune   [--older-than DUR] [--max-total SIZE] [--dry-run] [--dir FOLDER]   old Derived Data
 ```
 
 Options for both platforms:
@@ -190,14 +190,35 @@ A project on an external disk keeps its Derived Data on that disk, off the inter
 
 `SIMLEASE_DERIVED_DATA_DIR=/absolute/folder` puts every project's Derived Data under that folder instead, as `<key>/<UDID>`. It moves nothing else: locks and leases stay in `SIMLEASE_DIR`, so leasing keeps working while an external disk is unplugged.
 
-macOS empties `${TMPDIR}` by itself. Nothing empties a volume, and SimLease never deletes Derived Data on its own. Each `<key>` folder on a volume, or under `SIMLEASE_DERIVED_DATA_DIR`, holds a `simlease-project.json` that names its project. `prune` reads it:
+Each `<key>` folder on a volume, or under `SIMLEASE_DERIVED_DATA_DIR`, holds a `simlease-project.json` that names its project.
+
+### Pruning
+
+One build fills its folder with 3-10 GB, and agents build in many projects and worktrees. SimLease deletes old folders itself, one `<key>/<UDID>` folder at a time:
+
+1. Never a folder an active lease points into, or one used in the last 2 hours.
+2. A folder not used for 24 hours goes.
+3. So does one whose project folder is gone (on a volume or under `SIMLEASE_DERIVED_DATA_DIR`, where folders name their project).
+4. Then, while a place holds more than 40 GB, the oldest of the rest go.
+5. Empty `<key>` folders go too.
+
+- **Last use.** The newest change of anything inside the folder, not only the folder's own date. `exec` and `release` also mark the folder as used.
+- **When.** `acquire` and `release` start a sweep in the background, at most once every 10 minutes. It never slows down or fails the command. It runs in its own process group, so it finishes after an agent's tool call ends. It logs what it deletes in `${TMPDIR}/simlease/derived-data-prune.log`.
+- **Where.** The default folder in `${TMPDIR}`, `SIMLEASE_DERIVED_DATA_DIR`, the current project's volume, and every volume a lease used before, when it's plugged in. The 40 GB cap applies to each place on its own. On a volume or under `SIMLEASE_DERIVED_DATA_DIR`, a `<key>` folder without its own `simlease-project.json` is never touched.
+- **Many agents at once.** One sweep runs at a time, under a `lockf` lock. Right before a folder goes, the sweep checks the leases and the folder's last use again, moves the folder aside in one rename, and checks the leases once more. If a lease took the folder in that moment, it moves back. A build never sees a folder half deleted.
+
+By hand:
 
 ```bash
-simlease prune                                                     # the current folder's volume; lists only
-simlease prune --dir /Volumes/Work/simlease-derived-data --delete
+simlease prune --dry-run                           # list what would go; delete nothing
+simlease prune                                     # the same rules, now
+simlease prune --older-than 7d --max-total 100G    # other limits for this run
+simlease prune --dir /Volumes/Work/simlease-derived-data
 ```
 
-`prune` prints one line per folder: `stale` (the project folder is gone), `in-use` (it exists), `leased` (a lease points into it) or `unknown` (the project's parent folder is missing too: it moved, or its volume isn't mounted). Only `stale` folders are deleted, and only with `--delete`, which reports them as `deleted`. A folder without its own `simlease-project.json` is never touched.
+`prune` prints one line per folder: what happened (`deleted`, `would-delete`, `kept`, `failed`), why (`old`, `over-cap`, `project-gone`, `empty`, `leased`, `recent`, `fits`, or `busy`: it couldn't be read in full, because a build is changing it or access is denied), the size, how long ago it was last used, and the path. `--older-than` takes `90m`, `24h` or `7d`; `--max-total` takes `500M`, `40G` or `1T`; both take `off`. `status` shows each place's size from the last sweep.
+
+Change the defaults with `SIMLEASE_DERIVED_DATA_MAX_AGE`, `SIMLEASE_DERIVED_DATA_MAX_TOTAL`, `SIMLEASE_DERIVED_DATA_KEEP_RECENT` and `SIMLEASE_AUTO_PRUNE_INTERVAL` ([Configuration](#configuration)). `SIMLEASE_AUTO_PRUNE=0` turns the background sweep off.
 
 Only builds that are given `DERIVED_DATA_PATH` use it. `flutter run`, Xcode and MCP build tools pick their own build folders unless you pass them the path.
 
@@ -326,6 +347,11 @@ A previously started `serve-sim` helper doesn't reserve its Simulator. `status` 
 | `SIMLEASE_ANDROID_FIRST_PORT` / `_LAST_PORT` | 5560 / 5680 | Emulator console port range. |
 | `SIMLEASE_DIR` | `${TMPDIR}/simlease` | Shared state. Every cooperating process must use the same one. |
 | `SIMLEASE_DERIVED_DATA_DIR` | unset | An absolute folder for every project's [Derived Data](#derived-data). Moves nothing else. |
+| `SIMLEASE_DERIVED_DATA_MAX_AGE` | `24h` | [Prune](#pruning) Derived Data folders not used for this long. `off` turns this rule off. |
+| `SIMLEASE_DERIVED_DATA_MAX_TOTAL` | `40G` | Then prune the oldest until each place holds no more than this. `off` for no cap. |
+| `SIMLEASE_DERIVED_DATA_KEEP_RECENT` | `2h` | Never prune a folder used this recently. |
+| `SIMLEASE_AUTO_PRUNE` | `1` | `0` turns off the background prune after `acquire` and `release`. |
+| `SIMLEASE_AUTO_PRUNE_INTERVAL` | `10m` | At most one background prune per interval. |
 | `SIMLEASE_CONFIG_DIR` | `~/.config/simlease` | Where the profile and pinned list live. |
 
 ## Requirements

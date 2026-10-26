@@ -18,8 +18,28 @@ DERIVED_DATA_MARKER='simlease-project.json'
 # Set by choose_derived_data_dir.
 DERIVED_DATA_PROJECT_DIR=""
 DERIVED_DATA_WARNING=""
+# Pruning works on device folders, <key>/<UDID>. One idle for MAX_AGE is
+# deleted; then the oldest go until each place fits MAX_TOTAL. A folder a lease
+# points into, or one used in the last KEEP_RECENT, is never deleted. acquire
+# and release start a sweep in the background, at most once every
+# AUTO_PRUNE_INTERVAL.
+DERIVED_DATA_MAX_AGE="${SIMLEASE_DERIVED_DATA_MAX_AGE:-24h}"
+DERIVED_DATA_MAX_TOTAL="${SIMLEASE_DERIVED_DATA_MAX_TOTAL:-40G}"
+DERIVED_DATA_KEEP_RECENT="${SIMLEASE_DERIVED_DATA_KEEP_RECENT:-2h}"
+AUTO_PRUNE_INTERVAL="${SIMLEASE_AUTO_PRUNE_INTERVAL:-10m}"
+# Every DerivedData folder outside the lease directory that a lease has used.
+DERIVED_DATA_ROOTS_FILE="${LEASE_ROOT}/derived-data-roots"
+DERIVED_DATA_USAGE_FILE="${LEASE_ROOT}/derived-data-usage.json"
+PRUNE_STAMP_PATH="${LEASE_ROOT}/derived-data-prune.stamp"
+PRUNE_LOG_PATH="${LEASE_ROOT}/derived-data-prune.log"
+DERIVED_DATA_TRASH='.simlease-trash'
+DERIVED_DATA_KEY_PATTERN='^[0-9a-f]{12}$'
+SIMULATOR_UDID_PATTERN='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
+# A scratch folder for one sweep, set by run_prune.
+PRUNE_WORK=""
 RUNTIME_ROOT="${SIMLEASE_RUNTIME_DIR:-${TMPDIR:-/tmp}/simlease-runtime}"
 POOL_LOCK_PATH="${LOCK_DIR}/pool.lock"
+PRUNE_LOCK_PATH="${LOCK_DIR}/derived-data-prune.lock"
 SERVE_SIM_STATE_DIR="${SIMLEASE_SERVE_SIM_STATE_DIR:-${TMPDIR:-/tmp}/serve-sim}"
 DEFAULT_TTL_SECONDS="${SIMLEASE_TTL_SECONDS:-3600}"
 MIN_FREE_MEMORY_MB="${SIMLEASE_MIN_FREE_MEMORY_MB:-4096}"
@@ -52,7 +72,7 @@ Usage:
   simlease renew --token TOKEN [--ttl SECONDS] [--json]
   simlease release --token TOKEN [--json]
   simlease exec --token TOKEN -- COMMAND [ARG ...]
-  simlease prune [--dir FOLDER] [--delete]
+  simlease prune [--older-than DURATION] [--max-total SIZE] [--dry-run] [--dir FOLDER]
 
 renew, release and exec also take --token-file PATH in place of --token TOKEN.
 exec keeps renewing the lease while COMMAND runs, so a long run outlives the TTL.
@@ -95,14 +115,25 @@ from the folder acquire ran in. A project on a volume other than the boot volume
 its DerivedData stays on that volume. If that folder cannot be written, the lease
 warns and uses the default. Each <key> folder on a volume holds
 simlease-project.json, which names its project.
-prune lists the <key> folders in a volume's simlease-derived-data whose project
-folder is gone, and removes them only with --delete. It never touches a folder
-without that file or one an active lease points into. Nothing is removed
-automatically. Without --dir it looks at the volume of the current folder.
+
+prune deletes old DerivedData. For each <key>/<UDID> folder it takes the newest
+change of anything inside, and deletes the folder when that is older than
+--older-than (default 24h), or when its project folder is gone. Then, while a
+place still holds more than --max-total (default 40G), it deletes the oldest of
+the rest. It never deletes a folder an active lease points into, or one used in
+the last 2h (SIMLEASE_DERIVED_DATA_KEEP_RECENT). Empty <key> folders go too.
+--dry-run only lists. Without --dir it looks at every place leases use: the
+default, SIMLEASE_DERIVED_DATA_DIR, the current project's volume and every
+volume a lease used before. acquire and release run the same sweep with the
+defaults in the background, at most once every 10m (SIMLEASE_AUTO_PRUNE_INTERVAL;
+SIMLEASE_AUTO_PRUNE=0 turns it off). Durations: 90m, 24h, 7d. Sizes: 500M, 40G,
+1T, or off. status shows the size from the last sweep.
 
 SIMLEASE_DIR overrides the shared state directory.
 SIMLEASE_DERIVED_DATA_DIR puts every project's DerivedData under that folder
 (absolute path), as <key>/<UDID>. It changes nothing else.
+SIMLEASE_DERIVED_DATA_MAX_AGE, SIMLEASE_DERIVED_DATA_MAX_TOTAL and
+SIMLEASE_DERIVED_DATA_KEEP_RECENT change the prune defaults (24h, 40G, 2h).
 SIMLEASE_WORKSPACE overrides the workspace recorded in lease metadata.
 SIMLEASE_DEVICES may contain test-only TSV device rows.
 SIMLEASE_MIN_FREE_MEMORY_MB defaults to 4096.
@@ -232,17 +263,56 @@ project_volume() {
 }
 
 # Writes the marker that names the project a DerivedData <key> folder belongs
-# to, unless the folder already has one.
+# to (the current one unless given), unless the folder already has one.
 mark_derived_data_dir() {
     local marker="$1/${DERIVED_DATA_MARKER}"
+    local project="${2:-$PROJECT_ROOT}"
     [[ ! -s "$marker" ]] || return 0
     {
-        jq -n --arg project "$PROJECT_ROOT" --arg createdAt "$(utc_timestamp "$(date +%s)")" \
+        jq -n --arg project "$project" --arg createdAt "$(utc_timestamp "$(date +%s)")" \
             '{project:$project,createdAt:$createdAt}' > "${marker}.tmp.$$" \
             && mv "${marker}.tmp.$$" "$marker"
     } 2>/dev/null && return 0
     rm -f "${marker}.tmp.$$" 2>/dev/null || true
     return 1
+}
+
+# The physical path of a folder that need not exist yet: its parent's real path
+# plus its own name. /var is a link to /private/var, and TMPDIR ends in a slash.
+canonical_path() {
+    local path="${1%/}"
+    local parent="${path%/*}"
+    [[ -n "$parent" ]] || parent=/
+    parent="$(cd -- "$parent" >/dev/null 2>&1 && pwd -P)" || { printf '%s\n' "$path"; return 0; }
+    printf '%s/%s\n' "${parent%/}" "${path##*/}"
+}
+
+# Remembers a DerivedData folder outside the lease directory, so every sweep
+# looks there, whichever project starts it.
+register_derived_data_root() {
+    if [[ -f "$DERIVED_DATA_ROOTS_FILE" ]] && grep -qxF -- "$1" "$DERIVED_DATA_ROOTS_FILE" 2>/dev/null; then
+        return 0
+    fi
+    printf '%s\n' "$1" >> "$DERIVED_DATA_ROOTS_FILE" 2>/dev/null || true
+}
+
+# Marks a lease's DerivedData folder as used now: a folder's own mtime counts
+# as a use, so a sweep keeps a folder released a minute ago. Outside the lease
+# directory it also puts the <key> folder's marker back, in case a sweep took
+# an empty <key> folder just as this lease began.
+touch_derived_data() {
+    local metadata="$1"
+    local path
+    local key_dir
+    local project
+    path="$(jq -r '.derivedDataPath // empty' "$metadata" 2>/dev/null || true)"
+    [[ -n "$path" && "${path##*/}" =~ $SIMULATOR_UDID_PATTERN ]] || return 0
+    touch -c -- "$path" 2>/dev/null || true
+    key_dir="${path%/*}"
+    [[ "$(canonical_path "${key_dir%/*}")" != "$(canonical_path "$DERIVED_DATA_ROOT")" && -d "${key_dir%/*}" ]] || return 0
+    project="$(jq -r '.workspace // empty' "$metadata" 2>/dev/null || true)"
+    [[ -n "$project" && "$(workspace_key "$project")" == "${key_dir##*/}" ]] || return 0
+    { ( umask 077; mkdir -p "$key_dir" ) && mark_derived_data_dir "$key_dir" "$project"; } 2>/dev/null || true
 }
 
 # Decides where this project's DerivedData goes: SIMLEASE_DERIVED_DATA_DIR when
@@ -273,6 +343,7 @@ choose_derived_data_dir() {
     if ( umask 077; mkdir -p "${wanted_root}/${key}" ) 2>/dev/null \
         && [[ -w "${wanted_root}/${key}" ]] && mark_derived_data_dir "${wanted_root}/${key}"; then
         DERIVED_DATA_PROJECT_DIR="${wanted_root}/${key}"
+        register_derived_data_root "$wanted_root"
     else
         DERIVED_DATA_WARNING="cannot write DerivedData to ${wanted_root}; it goes to ${DERIVED_DATA_ROOT} instead"
     fi
@@ -1442,8 +1513,8 @@ status_json() {
 
     capacity="$(capacity_json)"
     jq -n --arg leaseDirectory "$LEASE_ROOT" --slurpfile devices "$result_file" --argjson capacity "$capacity" \
-        --argjson androidCapacity "$(capacity_json android)" \
-        '{leaseDirectory:$leaseDirectory,capacity:$capacity,androidCapacity:$androidCapacity,devices:$devices[0]}'
+        --argjson androidCapacity "$(capacity_json android)" --argjson derivedData "$(derived_data_status_json)" \
+        '{leaseDirectory:$leaseDirectory,capacity:$capacity,androidCapacity:$androidCapacity,derivedData:$derivedData,devices:$devices[0]}'
     rm -f "$devices_file" "$result_file"
 }
 
@@ -1461,10 +1532,21 @@ status_leases() {
     fi
 
     status_json | jq -r '
-        if (.devices | length) == 0 then
-            "No booted simulators or active leases.\n" +
-            "Capacity: \(.capacity.freeMemoryMB) MB free; can boot another: \(.capacity.canBootAnother) (\(.capacity.reason))\n" +
-            "Emulators: \(.androidCapacity.bootedSimulators)/\(.androidCapacity.maxBootedSimulators) running; can boot another: \(.androidCapacity.canBootAnother) (\(.androidCapacity.reason))"
+        def ago: (now - .) / 60 | floor
+            | if . < 60 then "\(.)m" elif . < 2880 then "\(. / 60 | floor)h" else "\(. / 1440 | floor)d" end;
+        def derived_data_lines: .derivedData as $d
+            | if ($d.roots | length) == 0 then
+                ["DerivedData: not measured yet; simlease prune --dry-run measures it"]
+              else
+                [$d.roots[] | "DerivedData: \(.size) in \(.folders) folder(s) at \(.path)"]
+                + ["DerivedData measured \($d.measuredAtEpoch | ago) ago; "
+                   + (if $d.autoPrune then "auto-prune deletes folders idle \($d.maxAge) and keeps each place under \($d.maxTotal)"
+                      else "auto-prune is off" end)]
+              end;
+        (if (.devices | length) == 0 then
+            ["No booted simulators or active leases.",
+             "Capacity: \(.capacity.freeMemoryMB) MB free; can boot another: \(.capacity.canBootAnother) (\(.capacity.reason))",
+             "Emulators: \(.androidCapacity.bootedSimulators)/\(.androidCapacity.maxBootedSimulators) running; can boot another: \(.androidCapacity.canBootAnother) (\(.androidCapacity.reason))"]
         else
             (["STATE\tDEVICE\tUUID\tSERVE-SIM\tOWNER\tPURPOSE\tEXPIRES"] +
              [.devices[] |
@@ -1478,8 +1560,8 @@ status_leases() {
                     (.lease.expiresAt // "-")
                 ] | @tsv] +
              ["Capacity: \(.capacity.freeMemoryMB) MB free; \(.capacity.bootedSimulators)/\(.capacity.maxBootedSimulators) booted; can boot another: \(.capacity.canBootAnother) (\(.capacity.reason))",
-              "Emulators: \(.androidCapacity.bootedSimulators)/\(.androidCapacity.maxBootedSimulators) running; can boot another: \(.androidCapacity.canBootAnother) (\(.androidCapacity.reason))"]) | .[]
-        end'
+              "Emulators: \(.androidCapacity.bootedSimulators)/\(.androidCapacity.maxBootedSimulators) running; can boot another: \(.androidCapacity.canBootAnother) (\(.androidCapacity.reason))"])
+        end) + derived_data_lines | .[]'
 }
 
 renew_by_hash() {
@@ -1610,6 +1692,7 @@ release_lease() {
     udid="$(jq -r '.udid' "$metadata")"
     device_name="$(jq -r '.deviceName' "$metadata")"
     booted_by_simlease="$(jq -r '.bootedBySimLease // false' "$metadata")"
+    touch_derived_data "$metadata"
     release_file="${SIGNAL_DIR}/${hashed_token}.release"
     : > "$release_file"
 
@@ -1674,6 +1757,7 @@ execute_with_lease() {
         SIMULATOR_UDID="$(jq -r '.udid' "$metadata")"
         SIMULATOR_NAME="$(jq -r '.deviceName' "$metadata")"
         DERIVED_DATA_PATH="$(jq -r '.derivedDataPath' "$metadata")"
+        touch_derived_data "$metadata"
     fi
     # Without this, a `flutter run` longer than the TTL loses its Simulator:
     # the guard shuts it down the moment the lease expires.
@@ -1684,94 +1768,517 @@ execute_with_lease() {
     exec "$@"
 }
 
-# True when a lease's DerivedData path lies in the folder. Folders are compared
-# by device and inode, so another spelling of the same path still matches. A
-# folder that cannot be read counts as leased.
-derived_data_dir_is_leased() {
-    local identity
-    local metadata
-    local leased_path
+# Seconds in a duration such as 90s, 30m, 24h, 7d, 2w or 3600, or "off".
+parse_duration() {
+    local pattern='^([0-9]+)([smhdw]?)$'
+    local count
+    if [[ "$1" == "off" ]]; then
+        printf 'off\n'
+        return 0
+    fi
+    [[ "$1" =~ $pattern ]] || return 1
+    count=$(( 10#${BASH_REMATCH[1]} ))
+    case "${BASH_REMATCH[2]}" in
+        m) count=$(( count * 60 )) ;;
+        h) count=$(( count * 3600 )) ;;
+        d) count=$(( count * 86400 )) ;;
+        w) count=$(( count * 604800 )) ;;
+    esac
+    printf '%s\n' "$count"
+}
 
-    identity="$(/usr/bin/stat -L -f '%d:%i' "$1" 2>/dev/null || true)"
-    [[ -n "$identity" ]] || return 0
+# KiB in a size such as 500M, 40G or 1T (40GB and 40GiB too), 0, or "off".
+parse_size_kb() {
+    local pattern='^([0-9]+)([KkMmGgTt])([Ii]?[Bb])?$'
+    local count
+    case "$1" in
+        off) printf 'off\n'; return 0 ;;
+        0) printf '0\n'; return 0 ;;
+    esac
+    [[ "$1" =~ $pattern ]] || return 1
+    count=$(( 10#${BASH_REMATCH[1]} ))
+    case "${BASH_REMATCH[2]}" in
+        M|m) count=$(( count * 1024 )) ;;
+        G|g) count=$(( count * 1048576 )) ;;
+        T|t) count=$(( count * 1073741824 )) ;;
+    esac
+    printf '%s\n' "$count"
+}
+
+# A size in KiB for people: 512K, 5.1G.
+human_size() {
+    awk -v kb="$1" 'BEGIN {
+        split("K M G T", unit, " "); value = kb + 0; i = 1
+        while (value >= 1024 && i < 4) { value /= 1024; i++ }
+        if (i == 1) printf "%dK\n", value; else printf "%.1f%s\n", value, unit[i]
+    }'
+}
+
+# Seconds for people: 45m, 30h, 12d. A negative number means unknown.
+human_age() {
+    if [[ "$1" -lt 0 ]]; then printf -- '-\n'
+    elif [[ "$1" -lt 3600 ]]; then printf '%sm\n' $(( $1 / 60 ))
+    elif [[ "$1" -lt 172800 ]]; then printf '%sh\n' $(( $1 / 3600 ))
+    else printf '%sd\n' $(( $1 / 86400 ))
+    fi
+}
+
+# Prints "<newest mtime> <size in KiB>" for a folder and everything in it: the
+# newest change of any file or folder inside, not only the folder's own mtime.
+# Fails when any part could not be read (no permission, or a build is changing
+# it right now); a sweep keeps such a folder. Hard links count once, as in du.
+folder_stats() {
+    local listing="${PRUNE_WORK}/stat"
+    local errors="${PRUNE_WORK}/stat.err"
+    local status=0
+    find "$1" -exec stat -f '%m %b %l %i' {} + > "$listing" 2> "$errors" || status=1
+    [[ ! -s "$errors" ]] || status=1
+    awk '{
+            if ($1 > newest) newest = $1
+            if ($3 > 1) { if ($4 in seen) next; seen[$4] = 1 }
+            blocks += $2
+        } END { printf "%d %d\n", newest, (blocks + 1) / 2 }' "$listing"
+    return "$status"
+}
+
+# The real DerivedData path of every lease, one per line.
+leased_derived_data_paths() {
+    local metadata
+    local path
     for metadata in "$LEASE_DIR"/*.json; do
         [[ -f "$metadata" ]] || continue
-        leased_path="$(jq -r '.derivedDataPath // empty' "$metadata" 2>/dev/null || true)"
-        [[ -n "$leased_path" ]] || continue
-        [[ "$(/usr/bin/stat -L -f '%d:%i' "${leased_path%/*}" 2>/dev/null || true)" != "$identity" ]] || return 0
+        path="$(jq -r '.derivedDataPath // empty' "$metadata" 2>/dev/null || true)"
+        [[ -z "$path" ]] || canonical_path "$path"
     done
+}
+
+# True when a lease's DerivedData path is this device folder: the same real
+# path, or, when both exist, the same device and inode. It reads the leases
+# right now, or the list in $2.
+derived_data_folder_is_leased() {
+    local folder="$1"
+    local list="${2:-}"
+    local identity
+    local path
+    identity="$(/usr/bin/stat -f '%d:%i' "$folder" 2>/dev/null || true)"
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        [[ "$path" != "$folder" ]] || return 0
+        [[ -z "$identity" || "$(/usr/bin/stat -f '%d:%i' "$path" 2>/dev/null || true)" != "$identity" ]] || return 0
+    done < <(if [[ -n "$list" ]]; then cat "$list"; else leased_derived_data_paths; fi)
     return 1
 }
 
-# Lists the DerivedData <key> folders under a volume's simlease-derived-data
-# (or SIMLEASE_DERIVED_DATA_DIR) whose project folder is gone, and removes them
-# only with --delete. A folder counts only when it carries the marker written
-# at acquire and the marker's project hashes to the folder's name. A folder a
-# lease points into is never touched, and neither is one whose project may be
-# on a volume that is not mounted.
-prune_derived_data() {
-    local root=""
-    local wanted_root
-    local delete=false
+# True when a lease's DerivedData path lies in this <key> folder.
+derived_data_key_dir_is_leased() {
+    leased_derived_data_paths | PREFIX="$1/" awk 'index($0, ENVIRON["PREFIX"]) == 1 { found = 1 } END { exit !found }'
+}
+
+# Every DerivedData folder ("root") a sweep looks at, as real paths, each once:
+# the lease directory's own, SIMLEASE_DERIVED_DATA_DIR, the current project's
+# volume, and every root a lease used before. A root that is not there (its
+# disk is unplugged) is left out.
+derived_data_roots() {
+    local volume
+    local root
+    {
+        printf '%s\n' "$DERIVED_DATA_ROOT"
+        [[ "${SIMLEASE_DERIVED_DATA_DIR:-}" != /* ]] || printf '%s\n' "${SIMLEASE_DERIVED_DATA_DIR%/}"
+        volume="$(project_volume)" || true
+        [[ -z "$volume" ]] || printf '%s\n' "${volume}/${DERIVED_DATA_VOLUME_FOLDER}"
+        [[ ! -f "$DERIVED_DATA_ROOTS_FILE" ]] || cat "$DERIVED_DATA_ROOTS_FILE"
+    } | while IFS= read -r root; do
+        [[ -n "$root" ]] || continue
+        (cd -- "$root" >/dev/null 2>&1 && pwd -P) || true
+    done | awk 'NF && $0 != "/" && !seen[$0]++'
+}
+
+# Deletes one device folder a sweep chose. It checks once more that no lease
+# points into it and that nothing in it changed in the last KEEP_RECENT, moves
+# it aside in one rename (so a build never sees it half deleted), checks the
+# leases again and moves it back if a lease took it in that moment, and only
+# then deletes it. Prints deleted, leased, recent or failed.
+delete_derived_data_folder() {
+    local folder="$1"
+    local root="$2"
+    local trash="${root}/${DERIVED_DATA_TRASH}"
+    local recent
+    local target
+    if derived_data_folder_is_leased "$folder"; then
+        printf 'leased\n'
+        return 0
+    fi
+    if [[ "$PRUNE_KEEP_RECENT" -gt 0 ]]; then
+        if ! recent="$(find "$folder" -mtime "-${PRUNE_KEEP_RECENT}s" -print -quit 2>/dev/null)" || [[ -n "$recent" ]]; then
+            printf 'recent\n'
+            return 0
+        fi
+    fi
+    target="${trash}/$(basename "${folder%/*}")-${folder##*/}.$$"
+    if ! { ( umask 077; mkdir -p "$trash" ) && mv -- "$folder" "$target"; } 2>/dev/null; then
+        printf 'failed\n'
+        return 0
+    fi
+    if derived_data_folder_is_leased "$folder"; then
+        [[ -e "$folder" ]] || mv -- "$target" "$folder" 2>/dev/null || true
+        printf 'leased\n'
+        return 0
+    fi
+    rm -rf -- "$target" 2>/dev/null || true
+    rmdir -- "$trash" 2>/dev/null || true
+    printf 'deleted\n'
+}
+
+# Removes an empty <key> folder: its marker, Finder's .DS_Store, then the
+# folder. If something new appeared in it meanwhile, it stays, marker and all.
+remove_empty_key_dir() {
+    local key_dir="$1"
+    local marker="${key_dir}/${DERIVED_DATA_MARKER}"
+    local saved=""
+    [[ ! -f "$marker" ]] || saved="$(cat "$marker" 2>/dev/null || true)"
+    rm -f -- "$marker" "${key_dir}/.DS_Store" 2>/dev/null || true
+    rmdir -- "$key_dir" 2>/dev/null && return 0
+    if [[ -n "$saved" && ! -e "$marker" ]]; then
+        printf '%s\n' "$saved" > "$marker" 2>/dev/null || true
+    fi
+    return 1
+}
+
+# One sweep of one root. Prints a line per device folder and per empty <key>
+# folder: what happened, why, the size, how long ago it was last used, and the
+# path. Then a summary line, and a usage row for status. In the lease
+# directory's own root any <key> folder counts; anywhere else only one whose
+# marker names a project that hashes to the folder's name.
+prune_root() {
+    local root="$1"
+    local own_root=false
+    local now
     local key_dir
     local key
     local project
+    local project_state
+    local device_dir
+    local stats
     local state
-    local stale=0
+    local action
+    local reason
+    local size
+    local idle
+    local folder
+    local outcome
+    local others
+    local entry
+    local freed=0
+    local freed_folders=0
+    local left=0
+    local folders=0
+    local cap_note='no size cap'
+    local rows="${PRUNE_WORK}/rows"
+    local decisions="${PRUNE_WORK}/decisions"
+    local leased="${PRUNE_WORK}/leased"
+    local keys="${PRUNE_WORK}/keys"
+    local removed="${PRUNE_WORK}/removed"
+
+    [[ "$root" != "$(cd -- "$DERIVED_DATA_ROOT" >/dev/null 2>&1 && pwd -P)" ]] || own_root=true
+    now="$(date +%s)"
+    : > "$rows"
+    : > "$keys"
+    : > "$removed"
+    leased_derived_data_paths > "$leased"
+    # What an interrupted sweep left behind.
+    if [[ "$PRUNE_DRY_RUN" != "true" && -d "${root}/${DERIVED_DATA_TRASH}" ]]; then
+        rm -rf -- "${root:?}/${DERIVED_DATA_TRASH}" 2>/dev/null || true
+    fi
+    for key_dir in "$root"/*; do
+        key="${key_dir##*/}"
+        [[ "$key" =~ $DERIVED_DATA_KEY_PATTERN && -d "$key_dir" && ! -L "$key_dir" ]] || continue
+        project_state='-'
+        if [[ "$own_root" != "true" ]]; then
+            project="$(jq -r '.project // empty' "${key_dir}/${DERIVED_DATA_MARKER}" 2>/dev/null || true)"
+            [[ -n "$project" && "$(workspace_key "$project")" == "$key" ]] || continue
+            if [[ -e "$project" ]]; then
+                project_state='exists'
+            elif [[ -d "${project%/*}" ]]; then
+                project_state='gone'
+            else
+                # The parent is missing too: moved, or on a volume that is not mounted.
+                project_state='unknown'
+            fi
+        fi
+        printf '%s\n' "$key_dir" >> "$keys"
+        for device_dir in "$key_dir"/*; do
+            [[ "${device_dir##*/}" =~ $SIMULATOR_UDID_PATTERN && -d "$device_dir" && ! -L "$device_dir" ]] || continue
+            if stats="$(folder_stats "$device_dir")"; then state='ok'; else state='busy'; fi
+            ! derived_data_folder_is_leased "$device_dir" "$leased" || state='leased'
+            printf '%s\t%s\t%s\t%s\t%s\n' "${stats% *}" "${stats#* }" "$state" "$project_state" "$device_dir" >> "$rows"
+        done
+    done
+
+    # Oldest first. A folder idle for MAX_AGE goes, and one whose project is
+    # gone; then the oldest of the rest, while the root holds more than MAX_TOTAL.
+    sort -t "$(printf '\t')" -k1,1n "$rows" | awk -F '\t' -v OFS='\t' -v now="$now" -v keep="$PRUNE_KEEP_RECENT" \
+        -v maxage="$PRUNE_MAX_AGE" -v maxtotal="$PRUNE_MAX_TOTAL" '
+        { n++; newest[n] = $1; size[n] = $2; state[n] = $3; project[n] = $4; path[n] = $5; left += $2 }
+        END {
+            for (i = 1; i <= n; i++) {
+                idle = now - newest[i]
+                if (state[i] == "leased") act[i] = "keep" OFS "leased"
+                else if (state[i] == "busy") act[i] = "keep" OFS "busy"
+                else if (idle < keep) act[i] = "keep" OFS "recent"
+                else if (maxage != "off" && idle >= maxage + 0) act[i] = "delete" OFS "old"
+                else if (project[i] == "gone") act[i] = "delete" OFS "project-gone"
+                else act[i] = ""
+                if (act[i] ~ /^delete/) left -= size[i]
+            }
+            for (i = 1; i <= n; i++) {
+                if (act[i] != "") continue
+                if (maxtotal != "off" && left > maxtotal + 0) { act[i] = "delete" OFS "over-cap"; left -= size[i] }
+                else act[i] = "keep" OFS "fits"
+            }
+            for (i = 1; i <= n; i++) print act[i], size[i], (state[i] == "busy" ? -1 : now - newest[i]), path[i]
+        }' > "$decisions"
+
+    while IFS=$'\t' read -r action reason size idle folder; do
+        [[ -n "$folder" ]] || continue
+        if [[ "$action" == "delete" && "$PRUNE_DRY_RUN" == "true" ]]; then
+            action='would-delete'
+        elif [[ "$action" == "delete" ]]; then
+            outcome="$(delete_derived_data_folder "$folder" "$root")"
+            case "$outcome" in
+                deleted) action='deleted' ;;
+                failed) action='failed' ;;
+                *) action='kept'; reason="$outcome" ;;
+            esac
+        else
+            action='kept'
+        fi
+        if [[ "$action" == "deleted" || "$action" == "would-delete" ]]; then
+            freed=$(( freed + size ))
+            freed_folders=$(( freed_folders + 1 ))
+            printf '%s\n' "$folder" >> "$removed"
+        else
+            left=$(( left + size ))
+            folders=$(( folders + 1 ))
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$action" "$reason" "$(human_size "$size")" "$(human_age "$idle")" "$folder"
+    done < "$decisions"
+
+    # <key> folders left with no device folder in them.
+    while IFS= read -r key_dir; do
+        [[ -d "$key_dir" ]] || continue
+        others=0
+        for entry in "$key_dir"/* "$key_dir"/.[!.]*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            case "${entry##*/}" in
+                "$DERIVED_DATA_MARKER"|.DS_Store) continue ;;
+            esac
+            grep -qxF -- "$entry" "$removed" || others=$(( others + 1 ))
+        done
+        [[ "$others" -eq 0 ]] || continue
+        ! derived_data_key_dir_is_leased "$key_dir" || continue
+        # One this sweep did not empty must have been empty for a while: acquire
+        # creates a <key> folder before the first build fills it.
+        if ! PREFIX="${key_dir}/" awk 'index($0, ENVIRON["PREFIX"]) == 1 { found = 1 } END { exit !found }' "$removed" \
+            && [[ $(( now - $(/usr/bin/stat -f '%m' "$key_dir" 2>/dev/null || printf '%s' "$now") )) -lt "$PRUNE_KEEP_RECENT" ]]; then
+            continue
+        fi
+        if [[ "$PRUNE_DRY_RUN" == "true" ]]; then
+            action='would-delete'
+        elif remove_empty_key_dir "$key_dir"; then
+            action='deleted'
+        else
+            continue
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$action" 'empty' '0K' '-' "$key_dir"
+    done < "$keys"
+
+    [[ "$PRUNE_MAX_TOTAL" == "off" ]] || cap_note="cap $(human_size "$PRUNE_MAX_TOTAL")"
+    if [[ "$PRUNE_DRY_RUN" == "true" ]]; then
+        printf 'Would free %s in %s; %s would be left in %s folder(s) (%s). Nothing was deleted.\n' \
+            "$(human_size "$freed")" "$root" "$(human_size "$left")" "$folders" "$cap_note"
+        printf '%s\t%s\t%s\t%s\n' "$root" "$(( left + freed ))" "$(human_size "$(( left + freed ))")" \
+            "$(( folders + freed_folders ))" >> "${PRUNE_WORK}/usage"
+    else
+        printf 'Freed %s in %s; %s left in %s folder(s) (%s).\n' \
+            "$(human_size "$freed")" "$root" "$(human_size "$left")" "$folders" "$cap_note"
+        printf '%s\t%s\t%s\t%s\n' "$root" "$left" "$(human_size "$left")" "$folders" >> "${PRUNE_WORK}/usage"
+    fi
+    if [[ "$PRUNE_MAX_TOTAL" != "off" && "$left" -gt "$PRUNE_MAX_TOTAL" ]]; then
+        printf 'Still over the cap in %s: the rest is leased or was used in the last %s.\n' "$root" "$(human_age "$PRUNE_KEEP_RECENT")"
+    fi
+}
+
+# One sweep, run under the prune lock. Arguments: dry run (true or false), max
+# age (seconds or off), max total (KiB or off), keep recent (seconds), and one
+# root to look at instead of all of them.
+run_prune() {
+    local only_root="${5:-}"
+    local metadata
+    local udid
+    local root
+    local roots
+    local now
+    PRUNE_DRY_RUN="$1"
+    PRUNE_MAX_AGE="$2"
+    PRUNE_MAX_TOTAL="$3"
+    PRUNE_KEEP_RECENT="$4"
+    PRUNE_WORK="$(mktemp -d "${TMPDIR:-/tmp}/simlease-prune.XXXXXX")"
+    trap 'rm -rf "$PRUNE_WORK"' EXIT
+    # A lease whose guard died protects nothing; clear it, as status does.
+    for metadata in "$LEASE_DIR"/*.json; do
+        [[ -f "$metadata" ]] || continue
+        udid="$(jq -r '.udid // empty' "$metadata" 2>/dev/null || true)"
+        [[ -z "$udid" ]] || remove_metadata_if_stale "$udid"
+    done
+    # A full sweep resets the clock of the background one.
+    [[ "$PRUNE_DRY_RUN" == "true" || -n "$only_root" ]] || touch "$PRUNE_STAMP_PATH" 2>/dev/null || true
+    if [[ -n "$only_root" ]]; then roots="$only_root"; else roots="$(derived_data_roots)"; fi
+    : > "${PRUNE_WORK}/usage"
+    while IFS= read -r root; do
+        [[ -n "$root" ]] || continue
+        prune_root "$root"
+    done <<< "$roots"
+    # status shows what a sweep of every root measured.
+    [[ -z "$only_root" ]] || return 0
+    now="$(date +%s)"
+    if jq -Rn --argjson epoch "$now" --arg at "$(utc_timestamp "$now")" '
+        [inputs | split("\t") | {path: .[0], totalKB: (.[1] | tonumber), size: .[2], folders: (.[3] | tonumber)}]
+        | {measuredAt: $at, measuredAtEpoch: $epoch, totalKB: (map(.totalKB) | add // 0), roots: .}' \
+        < "${PRUNE_WORK}/usage" > "${DERIVED_DATA_USAGE_FILE}.tmp.$$" 2>/dev/null; then
+        mv "${DERIVED_DATA_USAGE_FILE}.tmp.$$" "$DERIVED_DATA_USAGE_FILE"
+    else
+        rm -f "${DERIVED_DATA_USAGE_FILE}.tmp.$$"
+    fi
+}
+
+# simlease prune: checks the options, then sweeps under the prune lock. It waits
+# up to two minutes for a sweep that is already running.
+prune_derived_data() {
+    local dry_run=false
+    local root=""
+    local wanted_root
+    local max_age="$DERIVED_DATA_MAX_AGE"
+    local max_total="$DERIVED_DATA_MAX_TOTAL"
+    local max_age_seconds
+    local max_total_kb
+    local keep_recent_seconds
+    local status
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --older-than) [[ $# -ge 2 ]] || fail '--older-than requires a duration'; max_age="$2"; shift 2 ;;
+            --max-total) [[ $# -ge 2 ]] || fail '--max-total requires a size'; max_total="$2"; shift 2 ;;
+            --dry-run) dry_run=true; shift ;;
             --dir) [[ $# -ge 2 ]] || fail '--dir requires a folder'; root="$2"; shift 2 ;;
-            --delete) delete=true; shift ;;
+            # Older versions deleted only with --delete. prune deletes by default now.
+            --delete) shift ;;
             -h|--help) usage; exit 0 ;;
             *) fail "unknown prune option '$1'" ;;
         esac
     done
-    initialize_directories
-    if [[ -z "$root" && -n "${SIMLEASE_DERIVED_DATA_DIR:-}" ]]; then
-        root="$SIMLEASE_DERIVED_DATA_DIR"
-    elif [[ -z "$root" ]]; then
-        root="$(project_volume)" || true
-        [[ -n "$root" ]] || fail 'this folder is on the boot volume, where DerivedData sits in the temporary folder macOS cleans; pass --dir FOLDER'
-        root="${root}/${DERIVED_DATA_VOLUME_FOLDER}"
+    max_age_seconds="$(parse_duration "$max_age")" \
+        || fail "--older-than (or SIMLEASE_DERIVED_DATA_MAX_AGE) must be a duration such as 90m, 24h or 7d, or off"
+    max_total_kb="$(parse_size_kb "$max_total")" \
+        || fail "--max-total (or SIMLEASE_DERIVED_DATA_MAX_TOTAL) must be a size such as 500M, 40G or 1T, or off"
+    keep_recent_seconds="$(parse_duration "$DERIVED_DATA_KEEP_RECENT")" \
+        || fail 'SIMLEASE_DERIVED_DATA_KEEP_RECENT must be a duration such as 2h'
+    [[ "$keep_recent_seconds" != "off" ]] || keep_recent_seconds=0
+    if [[ "$max_age_seconds" != "off" && "$max_age_seconds" -lt "$keep_recent_seconds" ]]; then
+        fail "--older-than must be at least ${DERIVED_DATA_KEEP_RECENT}: a folder used that recently is never deleted (SIMLEASE_DERIVED_DATA_KEEP_RECENT)"
     fi
-    wanted_root="$root"
-    if [[ ! -d "$root" ]]; then
-        printf 'No DerivedData folder at %s\n' "$root"
+    initialize_directories
+    if [[ -n "$root" ]]; then
+        wanted_root="$root"
+        if [[ ! -d "$root" ]]; then
+            printf 'No DerivedData folder at %s\n' "$root"
+            return 0
+        fi
+        root="$(cd -- "$root" >/dev/null 2>&1 && pwd -P)" || fail "cannot read '${wanted_root}'"
+        [[ "$root" != "/" ]] || fail '--dir must not be /'
+    fi
+    set +e
+    lockf -k -t 120 "$PRUNE_LOCK_PATH" "$SCRIPT_PATH" __prune \
+        "$dry_run" "$max_age_seconds" "$max_total_kb" "$keep_recent_seconds" "$root"
+    status=$?
+    set -e
+    [[ "$status" -ne 75 ]] || fail 'another prune is still running; try again in a few minutes'
+    return "$status"
+}
+
+# True when the last sweep started less than $1 seconds ago.
+prune_ran_recently() {
+    local stamp_time
+    [[ -f "$PRUNE_STAMP_PATH" ]] || return 1
+    stamp_time="$(/usr/bin/stat -f '%m' "$PRUNE_STAMP_PATH" 2>/dev/null || printf '0')"
+    [[ $(( $(date +%s) - stamp_time )) -lt "$1" ]]
+}
+
+# After acquire and release: starts a sweep with the defaults in the
+# background, unless one started in the last SIMLEASE_AUTO_PRUNE_INTERVAL. It
+# gets its own process group, so it finishes after the agent's tool call ends;
+# one stopped anyway leaves nothing half deleted in place. It never fails the
+# command that started it.
+start_auto_prune() {
+    local interval
+    [[ "${SIMLEASE_AUTO_PRUNE:-1}" != "0" ]] || return 0
+    interval="$(parse_duration "$AUTO_PRUNE_INTERVAL" 2>/dev/null)" || return 0
+    [[ "$interval" != "off" ]] || return 0
+    ! prune_ran_recently "$interval" || return 0
+    ( set -m 2>/dev/null || true; nohup "$SCRIPT_PATH" __auto-prune </dev/null >/dev/null 2>&1 & ) 2>/dev/null || true
+}
+
+# The background sweep: one at a time. What it deletes goes to the prune log.
+auto_prune() {
+    lockf -t 0 -k "$PRUNE_LOCK_PATH" "$SCRIPT_PATH" __auto-prune-locked >/dev/null 2>&1 || true
+}
+
+auto_prune_locked() {
+    local interval
+    local max_age
+    local max_total
+    local keep_recent
+    local output
+    if ! interval="$(parse_duration "$AUTO_PRUNE_INTERVAL")" \
+        || ! max_age="$(parse_duration "$DERIVED_DATA_MAX_AGE")" \
+        || ! max_total="$(parse_size_kb "$DERIVED_DATA_MAX_TOTAL")" \
+        || ! keep_recent="$(parse_duration "$DERIVED_DATA_KEEP_RECENT")"; then
+        printf '%s auto-prune skipped: a SIMLEASE_DERIVED_DATA_* or SIMLEASE_AUTO_PRUNE_INTERVAL value is not valid\n' \
+            "$(utc_timestamp "$(date +%s)")" >> "$PRUNE_LOG_PATH" 2>/dev/null || true
         return 0
     fi
-    root="$(cd -- "$root" >/dev/null 2>&1 && pwd -P)" || fail "cannot read '${wanted_root}'"
-    [[ "$root" != "/" ]] || fail '--dir must not be /'
-
-    for key_dir in "$root"/*; do
-        key="${key_dir##*/}"
-        [[ "$key" =~ ^[0-9a-f]{12}$ && -d "$key_dir" && ! -L "$key_dir" ]] || continue
-        project="$(jq -r '.project // empty' "${key_dir}/${DERIVED_DATA_MARKER}" 2>/dev/null || true)"
-        [[ -n "$project" && "$(workspace_key "$project")" == "$key" ]] || continue
-        if derived_data_dir_is_leased "$key_dir"; then
-            state='leased'
-        elif [[ -e "$project" ]]; then
-            state='in-use'
-        elif [[ ! -d "${project%/*}" ]]; then
-            # The project's parent folder is missing too: it was moved, or its
-            # volume is not mounted. Too uncertain to call stale.
-            state='unknown'
-        elif [[ "$delete" == "true" ]] && rm -rf -- "$key_dir" 2>/dev/null; then
-            state='deleted'
-            stale=$(( stale + 1 ))
-        elif [[ "$delete" == "true" ]]; then
-            state='not-deleted'
+    [[ "$interval" != "off" ]] || return 0
+    [[ "$keep_recent" != "off" ]] || keep_recent=0
+    # Another sweep may have finished while this one was starting.
+    ! prune_ran_recently "$interval" || return 0
+    output="$(run_prune false "$max_age" "$max_total" "$keep_recent" "" 2>&1)" || true
+    {
+        printf '%s auto-prune\n' "$(utc_timestamp "$(date +%s)")"
+        printf '%s\n' "$output" | grep -v '^kept' || true
+    } >> "$PRUNE_LOG_PATH" 2>/dev/null || true
+    # Keep the log short: the last 1000 lines once it passes 2000.
+    if [[ "$(wc -l < "$PRUNE_LOG_PATH" 2>/dev/null || printf '0')" -gt 2000 ]]; then
+        if tail -n 1000 "$PRUNE_LOG_PATH" > "${PRUNE_LOG_PATH}.tmp.$$" 2>/dev/null; then
+            mv "${PRUNE_LOG_PATH}.tmp.$$" "$PRUNE_LOG_PATH"
         else
-            state='stale'
-            stale=$(( stale + 1 ))
+            rm -f "${PRUNE_LOG_PATH}.tmp.$$"
         fi
-        printf '%s\t%s\t%s\n' "$state" "$key_dir" "$project"
-    done
-    if [[ "$delete" == "true" ]]; then
-        printf 'Deleted %s DerivedData folder(s) in %s\n' "$stale" "$root"
-    else
-        printf '%s stale DerivedData folder(s) in %s; nothing was deleted. Add --delete to remove them.\n' "$stale" "$root"
     fi
+}
+
+# What status says about DerivedData: the sizes the last full sweep measured,
+# and the prune settings.
+derived_data_status_json() {
+    local usage='null'
+    if [[ -s "$DERIVED_DATA_USAGE_FILE" ]] && jq -e 'type == "object"' "$DERIVED_DATA_USAGE_FILE" >/dev/null 2>&1; then
+        usage="$(cat "$DERIVED_DATA_USAGE_FILE")"
+    fi
+    jq -n --argjson usage "$usage" \
+        --argjson autoPrune "$([[ "${SIMLEASE_AUTO_PRUNE:-1}" != "0" ]] && printf 'true' || printf 'false')" \
+        --arg maxAge "$DERIVED_DATA_MAX_AGE" --arg maxTotal "$DERIVED_DATA_MAX_TOTAL" \
+        --arg keepRecent "$DERIVED_DATA_KEEP_RECENT" --arg interval "$AUTO_PRUNE_INTERVAL" \
+        '{autoPrune:$autoPrune,autoPruneInterval:$interval,maxAge:$maxAge,maxTotal:$maxTotal,keepRecent:$keepRecent,
+          measuredAt:($usage.measuredAt // null),measuredAtEpoch:($usage.measuredAtEpoch // null),
+          totalKB:($usage.totalKB // null),roots:($usage.roots // [])}'
 }
 
 main() {
@@ -1783,12 +2290,15 @@ main() {
     require_command uuidgen
 
     case "${1:-}" in
-        acquire) shift; acquire_lease "$@" ;;
+        acquire) shift; acquire_lease "$@"; start_auto_prune ;;
         status|list) shift; status_leases "$@" ;;
         renew) shift; renew_lease "$@" ;;
-        release) shift; release_lease "$@" ;;
+        release) shift; release_lease "$@"; start_auto_prune ;;
         exec) shift; execute_with_lease "$@" ;;
         prune) shift; prune_derived_data "$@" ;;
+        __prune) shift; initialize_directories; run_prune "$@" ;;
+        __auto-prune) initialize_directories; auto_prune ;;
+        __auto-prune-locked) initialize_directories; auto_prune_locked ;;
         __guard) shift; initialize_directories; guard_lease "$@" ;;
         __launchd-guard) shift; initialize_directories; launchd_guard_entry "$@" ;;
         __cleanup-stale) shift; initialize_directories; cleanup_stale_metadata_under_lock "$@" ;;
