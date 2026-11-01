@@ -38,6 +38,8 @@ def main() -> None:
         assert bash("adb -s emulator-5560 shell getprop")
         assert not bash("simlease exec --token-file t -- adb shell getprop")
         assert bash("simlease exec --token-file t -- xcrun simctl shutdown all")
+        assert bash("simlease exec --token-file t -- xcrun simctl --set testing delete all")
+        assert not bash("xcrun simctl --set testing list devices -j")
         assert bash("simlease exec --token-file t -- simslim on $SIMULATOR_UDID")
         for command in ("simslim watch", f"simslim --boot-timeout 15m on {SIM}", f"simslim repair-clone {SIM} B",
                         f"SimSlim on {SIM}", f"$(which simslim) on {SIM}", f"sudo simslim off {SIM}"):

@@ -27,6 +27,7 @@ SimLease is one Bash CLI plus an optional guard hook. It uses macOS `lockf` kern
 - [Quick start](#quick-start)
 - [Commands](#commands)
 - [Derived Data](#derived-data)
+- [Test clones](#test-clones)
 - [Slim Simulators](#slim-simulators)
 - [Android emulators](#android-emulators)
 - [Guard hooks](#guard-hooks)
@@ -114,6 +115,8 @@ simlease exec --token-file /tmp/agent-one.sim -- sh -c '
 simlease release --token-file /tmp/agent-one.sim
 ```
 
+Running one test or a few with `-only-testing:`? Add `-parallel-testing-enabled NO` ([Test clones](#test-clones)).
+
 Android:
 
 ```bash
@@ -135,6 +138,7 @@ simlease renew   (--token TOKEN | --token-file PATH) [--ttl SECONDS] [--json]
 simlease release (--token TOKEN | --token-file PATH) [--json]
 simlease exec    (--token TOKEN | --token-file PATH) -- COMMAND [ARG ...]
 simlease prune   [--older-than DUR] [--max-total SIZE] [--dry-run] [--dir FOLDER]   old Derived Data
+simlease sweep-clones [--older-than DUR] [--dry-run]                              leftover test clones
 ```
 
 Options for both platforms:
@@ -222,6 +226,29 @@ Change the defaults with `SIMLEASE_DERIVED_DATA_MAX_AGE`, `SIMLEASE_DERIVED_DATA
 
 Only builds that are given `DERIVED_DATA_PATH` use it. `flutter run`, Xcode and MCP build tools pick their own build folders unless you pass them the path.
 
+## Test clones
+
+With parallel testing on, `xcodebuild test` runs each test worker on a copy of the leased Simulator ("Clone 1 of iPhone 1", "Clone 2 of …") in Xcode's testing device set, `~/Library/Developer/XCTestDevices` (`simctl --set testing`). It deletes them when the run ends. But a short `-only-testing` run can exit while it is still making another clone (seen with Xcode 26.5 and 27.1). That clone never boots and stays for good. Each is a copy-on-write copy of the whole Simulator: `du` shows it at full size, though most of its blocks are shared.
+
+- **Prevent it.** Give a run of one test or a few `-parallel-testing-enabled NO`. It makes no clones and tests on the leased Simulator itself. Keep the full suite parallel.
+- **Clean up.** `acquire`, `release` and `exec` start a clone sweep in the background, at most once every 10 minutes. A clone goes only when all of these hold:
+  1. its name is `Clone N of …`;
+  2. it is shut down (never `Booted`, `Booting`, `Creating` or `Shutting Down`);
+  3. its `device.plist` and folder haven't changed for 30 minutes;
+  4. no `xcodebuild` that started before the clone was made still runs (the clone may be that run's).
+
+  Right before deleting, the sweep reads the `device.plist` again. Each clone goes with `xcrun simctl --set testing delete <UDID>`, one at a time, never `delete all`. A UDID folder there with no `device.plist` and no files goes after a day. Deletions are logged in `${TMPDIR}/simlease/test-clone-sweep.log`; a sweep with nothing to delete writes nothing.
+
+By hand:
+
+```bash
+simlease sweep-clones --dry-run          # list what would go; delete nothing
+simlease sweep-clones                    # the same rules, now
+simlease sweep-clones --older-than 2h    # wait longer (at least 10m)
+```
+
+It prints one line per clone: what happened (`deleted`, `would-delete`, `kept`, `failed`), why (`old`, `empty`, `recent`, `xcodebuild-running`, `changed`, or the state, such as `booted`), the age, the UDID and the name. `SIMLEASE_CLONE_SWEEP=0` turns the background sweep off.
+
 ## Slim Simulators
 
 When `simslim` is on `PATH`, every iOS acquire makes the leased Simulator match one shared profile, `~/.config/simlease/simslim-profile.json`:
@@ -275,14 +302,14 @@ The guard is a `PreToolUse` hook shared by Claude Code and Codex. It reads each 
 - Simulator MCP calls that don't name a leased UDID
 
 **Always blocked, even inside a lease.** These hit every agent's devices:
-- `simctl … all` and `simctl … booted`
+- `simctl … all` and `simctl … booted`, also after global options such as `--set testing` (`simctl --set testing delete all` deletes every agent's running test clones)
 - simslim commands that change a device: `on`, `off`, `watch`, `clone`, `repair-clone`, `erase`, `delete`, `disk-clean`, `boot`, `shutdown`, `rename`. Global options before the command, a full path, quotes and `$(which simslim)` don't get past it. `watch` slims every Simulator as it boots, other agents' too; `repair-clone` can keep another agent's Simulator shut down.
 - `killall` of Simulators or emulators
 - a `pkill` that doesn't name a port or serial
 - `adb kill-server`
 
 **Always allowed:**
-- read-only calls such as `xcrun simctl list`, `adb devices` and `emulator -list-avds`
+- read-only calls such as `xcrun simctl list` (also `xcrun simctl --set testing list`), `adb devices` and `emulator -list-avds`
 - read-only simslim commands: `list`, `profiles`, `status`, `verify`, `doctor`, `measure`, `size`, `top`, `disk-plan`, `disk-categories`, `version`, `profile`
 - text searches (`grep`, `rg`, `ag`, `git grep`) that mention device commands. A device command elsewhere in the same command line is still checked.
 - physical devices addressed with `adb -s <serial>`
@@ -306,6 +333,8 @@ Many agents share this Mac's devices. `simlease` leases every Simulator and emul
   Read-only ones are fine (`list`, `profiles`, `status`, `verify`, `doctor`, `measure`, `size`,
   `top --json`, `disk-plan`). To check features, run `simslim doctor "$SIMULATOR_UDID" --requires <features>`
   inside `simlease exec`.
+  One test or a few (`xcodebuild … -only-testing:…`): add `-parallel-testing-enabled NO`, or a short run can
+  leave a "Clone 2 of …" Simulator behind. simlease deletes leftover test clones.
 - Android: `simlease acquire --avd <AVD> --owner <task> --wait 900 --token-file <scratch>/emu.token --json`
   boots your own read-only instance. Then `simlease exec --token-file … -- adb …` or
   `-- sh -c 'flutter run -d "$ANDROID_SERIAL"'`.
@@ -352,6 +381,10 @@ A previously started `serve-sim` helper doesn't reserve its Simulator. `status` 
 | `SIMLEASE_DERIVED_DATA_KEEP_RECENT` | `2h` | Never prune a folder used this recently. |
 | `SIMLEASE_AUTO_PRUNE` | `1` | `0` turns off the background prune after `acquire` and `release`. |
 | `SIMLEASE_AUTO_PRUNE_INTERVAL` | `10m` | At most one background prune per interval. |
+| `SIMLEASE_CLONE_SWEEP` | `1` | `0` turns off the background [test clone](#test-clones) sweep after `acquire`, `release` and `exec`. |
+| `SIMLEASE_CLONE_SWEEP_INTERVAL` | `10m` | At most one background clone sweep per interval. |
+| `SIMLEASE_TEST_CLONE_MIN_AGE` | `30m` | A clone must be unchanged this long before it goes. At least `10m`. |
+| `SIMLEASE_TEST_DEVICE_SET_DIR` | `~/Library/Developer/XCTestDevices` | Where the sweep looks for empty leftover folders. |
 | `SIMLEASE_CONFIG_DIR` | `~/.config/simlease` | Where the profile and pinned list live. |
 
 ## Requirements

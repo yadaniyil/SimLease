@@ -39,6 +39,8 @@ Before the first device operation in a task, run `scripts/preflight`. If it fail
    '
    ```
 
+   For one test or a few (`-only-testing:…`), add `-parallel-testing-enabled NO`. A short parallel run can exit while xcodebuild is still making a "Clone 2 of …" Simulator, and that clone stays in `~/Library/Developer/XCTestDevices`. SimLease deletes such leftovers itself; `scripts/simlease sweep-clones --dry-run` lists them.
+
 6. `exec` keeps the lease alive while its command runs. For work outside `exec`, renew by hand: `scripts/simlease renew --token-file '<scratch>/sim.token' --ttl 3600`.
 7. Release in cleanup, including after failures: `scripts/simlease release --token-file '<scratch>/sim.token'`.
 
@@ -62,7 +64,7 @@ Never boot an emulator, or aim `adb` or `flutter` at one, outside a lease. Physi
 - Use `$DERIVED_DATA_PATH` (`derivedDataPath` in the acquire output) as given, never a hard-coded path. For a project on an external disk it is on that disk, under `<volume>/simlease-derived-data/`, so builds stay off the internal disk. SimLease deletes old Derived Data itself (unused for 24 h, or past 40 GB per disk, never a leased folder); `simlease prune --dry-run` lists what would go. Never delete these folders by hand: another agent may be building in one.
 - For `serve-sim`, use only the leased UDID. Reuse an existing helper when `serveSimAlreadyRunning` is true, and leave that inherited helper running during cleanup. Otherwise start one for that UDID, and stop only the helper started by the current task. Never stop a helper while another lease owns its Simulator.
 - Pinned Simulators (`~/.config/simlease/pinned`) hold a sign-in or seeded media. Lease one only with `--device <UDID>`, and only when the task needs that state.
-- Never run commands that hit every device, even inside a lease: `simctl … all`, `simctl … booted`, `killall Simulator`, `killall qemu-system…`, a `pkill` that doesn't name your port or serial, or `adb kill-server`.
+- Never run commands that hit every device, even inside a lease: `simctl … all` (also `simctl --set testing delete all`: it deletes other agents' running test clones), `simctl … booted`, `killall Simulator`, `killall qemu-system…`, a `pkill` that doesn't name your port or serial, or `adb kill-server`.
 - If all matching devices are leased, wait or continue other work. Never take over another lease.
 - With `--boot-if-needed`, SimLease checks memory pressure and the booted-device cap before it starts a shutdown Simulator. If either check fails, explain that it is waiting for an existing lease.
 - SimLease shuts down only a Simulator that it started for the current lease. Never manually shut down a Simulator that was already running.

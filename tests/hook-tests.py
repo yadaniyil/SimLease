@@ -90,8 +90,26 @@ def main() -> None:
             "pkill -f qemu-system",
             "pkill -f emulator",
             "adb kill-server",
+            # simctl's global options may come before the subcommand. `--set testing`
+            # holds every agent's running xcodebuild test clones.
+            "simlease exec --token abc -- xcrun simctl --set testing delete all",
+            "xcrun simctl --set testing erase all",
+            "xcrun simctl --set=testing shutdown all",
+            'xcrun simctl --set "$HOME/Library/Developer/XCTestDevices" delete all',
+            "xcrun simctl --set ~/My\\ Set delete all",
+            "xcrun simctl --set testing --profiles /tmp/p delete 'all'",
+            'xcrun simctl --set testing "delete" all',
+            "xcrun simctl --set testing list; xcrun simctl --set testing delete all",
+            "simlease exec --token abc -- xcrun simctl --set testing io booted screenshot a.png",
         ):
             assert bash_denied(command), command
+        reason = invoke("Bash", {"command": "xcrun simctl --set testing delete all"}, workspace, lease_root)
+        assert "sweep-clones" in reason["systemMessage"], reason
+        for command in (
+            "simlease exec --token abc -- xcrun simctl --set testing delete 0B722C7D-1D2D-4D1C-B038-8F584AA78D22",
+            "simlease exec --token abc -- xcrun simctl --set testing delete unavailable",
+        ):
+            assert not bash_denied(command), command
         for command in (
             "pkill -f 'qemu-system.* -port 5560'",
             "pkill -f 'flutter_tools.snapshot run -d emulator-5560'",
@@ -166,11 +184,17 @@ def main() -> None:
             "xcrun simctl list devices booted",
             "xcrun simctl list devices | grep -i booted",
             "xcrun simctl help",
+            "xcrun simctl --set testing list devices -j",
+            "xcrun simctl --set testing list devices booted",
+            "xcrun simctl --set=testing list",
+            'xcrun simctl --set "$HOME/Library/Developer/XCTestDevices" list devices',
         ):
             assert not bash_denied(command), command
         for command in (
             f"xcrun simctl boot {UDID}",
             f"xcrun simctl list devices -j; xcrun simctl boot {UDID}",
+            f"xcrun simctl --set testing boot {UDID}",
+            f"xcrun simctl --set testing list; xcrun simctl --set testing boot {UDID}",
         ):
             assert bash_denied(command), command
 

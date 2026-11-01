@@ -37,9 +37,22 @@ DERIVED_DATA_KEY_PATTERN='^[0-9a-f]{12}$'
 SIMULATOR_UDID_PATTERN='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
 # A scratch folder for one sweep, set by run_prune.
 PRUNE_WORK=""
+# Parallel testing runs each xcodebuild test worker on a copy of the leased
+# Simulator, "Clone N of <name>", in Xcode's testing device set (`simctl --set
+# testing`). A short -only-testing run can exit while it is still making one,
+# and that clone stays, shut down, for good. sweep-clones deletes those.
+TEST_DEVICE_SET_DIR="${SIMLEASE_TEST_DEVICE_SET_DIR:-${HOME}/Library/Developer/XCTestDevices}"
+TEST_CLONE_MIN_AGE="${SIMLEASE_TEST_CLONE_MIN_AGE:-30m}"
+TEST_CLONE_SWEEP_INTERVAL="${SIMLEASE_CLONE_SWEEP_INTERVAL:-10m}"
+TEST_CLONE_NAME_PATTERN='^Clone [0-9]+ of .'
+# A folder with no device.plist and no files goes once it is this old (seconds).
+TEST_CLONE_EMPTY_FOLDER_AGE=86400
+TEST_CLONE_STAMP_PATH="${LEASE_ROOT}/test-clone-sweep.stamp"
+TEST_CLONE_LOG_PATH="${LEASE_ROOT}/test-clone-sweep.log"
 RUNTIME_ROOT="${SIMLEASE_RUNTIME_DIR:-${TMPDIR:-/tmp}/simlease-runtime}"
 POOL_LOCK_PATH="${LOCK_DIR}/pool.lock"
 PRUNE_LOCK_PATH="${LOCK_DIR}/derived-data-prune.lock"
+TEST_CLONE_LOCK_PATH="${LOCK_DIR}/test-clone-sweep.lock"
 SERVE_SIM_STATE_DIR="${SIMLEASE_SERVE_SIM_STATE_DIR:-${TMPDIR:-/tmp}/serve-sim}"
 DEFAULT_TTL_SECONDS="${SIMLEASE_TTL_SECONDS:-3600}"
 MIN_FREE_MEMORY_MB="${SIMLEASE_MIN_FREE_MEMORY_MB:-4096}"
@@ -73,6 +86,7 @@ Usage:
   simlease release --token TOKEN [--json]
   simlease exec --token TOKEN -- COMMAND [ARG ...]
   simlease prune [--older-than DURATION] [--max-total SIZE] [--dry-run] [--dir FOLDER]
+  simlease sweep-clones [--older-than DURATION] [--dry-run]
 
 renew, release and exec also take --token-file PATH in place of --token TOKEN.
 exec keeps renewing the lease while COMMAND runs, so a long run outlives the TTL.
@@ -128,6 +142,19 @@ volume a lease used before. acquire and release run the same sweep with the
 defaults in the background, at most once every 10m (SIMLEASE_AUTO_PRUNE_INTERVAL;
 SIMLEASE_AUTO_PRUNE=0 turns it off). Durations: 90m, 24h, 7d. Sizes: 500M, 40G,
 1T, or off. status shows the size from the last sweep.
+
+sweep-clones deletes test clones xcodebuild left behind. Parallel testing runs
+each test worker on a "Clone N of <Simulator>" copy in Xcode's testing device set
+(~/Library/Developer/XCTestDevices); a short -only-testing run can exit while it
+is still making one, and that copy stays. A clone goes only when it is shut
+down, its device.plist and folder have not changed for --older-than (default
+30m, at least 10m), and no xcodebuild that started before the clone was made
+still runs. Each goes with `simctl --set testing delete <UDID>`, one at a time.
+A UDID folder there with no device.plist and no files goes after a day.
+--dry-run only lists. acquire, release and exec run it in the background at
+most once every 10m (SIMLEASE_CLONE_SWEEP_INTERVAL; SIMLEASE_CLONE_SWEEP=0 turns
+it off); what it deletes goes to SIMLEASE_DIR/test-clone-sweep.log. Pass
+-parallel-testing-enabled NO to a single-test xcodebuild run: it makes no clones.
 
 SIMLEASE_DIR overrides the shared state directory.
 SIMLEASE_DERIVED_DATA_DIR puts every project's DerivedData under that folder
@@ -1765,6 +1792,8 @@ execute_with_lease() {
     [[ "$renew_interval" -ge 1 ]] || renew_interval=1
     [[ "$renew_interval" -le 300 ]] || renew_interval=300
     keep_lease_alive "$hashed_token" "$$" "$renew_interval" </dev/null >/dev/null 2>&1 &
+    # Clones an earlier test run in this lease left behind go while this one runs.
+    start_clone_sweep
     exec "$@"
 }
 
@@ -2281,6 +2310,240 @@ derived_data_status_json() {
           totalKB:($usage.totalKB // null),roots:($usage.roots // [])}'
 }
 
+# simctl, or the fake one the tests name in SIMLEASE_SIMCTL.
+simctl_tool() {
+    if [[ -n "${SIMLEASE_SIMCTL:-}" ]]; then
+        "$SIMLEASE_SIMCTL" "$@"
+    else
+        xcrun simctl "$@"
+    fi
+}
+
+# The tests fake every Simulator (SIMLEASE_DEVICES): they never reach the real
+# testing set unless they name a fake simctl too.
+test_clone_sweep_available() {
+    [[ -n "${SIMLEASE_SIMCTL:-}" || -z "${SIMLEASE_DEVICES:-}" ]]
+}
+
+# The newest mtime of the paths given, or a failure when one cannot be read.
+newest_mtime() {
+    local newest=""
+    local mtime
+    local path
+    for path in "$@"; do
+        mtime="$(/usr/bin/stat -f '%m' "$path" 2>/dev/null)" || return 1
+        [[ -n "$newest" && "$newest" -ge "$mtime" ]] || newest="$mtime"
+    done
+    printf '%s\n' "$newest"
+}
+
+# When each running xcodebuild started (epoch seconds), one per line. Fails
+# when ps does. SIMLEASE_TEST_PS stands in for `ps -axo etime=,comm=` in the tests.
+xcodebuild_start_times() {
+    {
+        if [[ -n "${SIMLEASE_TEST_PS+set}" ]]; then
+            printf '%s\n' "$SIMLEASE_TEST_PS"
+        else
+            ps -axo etime=,comm= 2>/dev/null
+        fi
+    } | awk -v now="$(date +%s)" '
+        NF >= 2 {
+            elapsed = $1
+            command = $0
+            sub(/^[ \t]*[^ \t]+[ \t]+/, "", command)
+            sub(/.*\//, "", command)
+            if (command != "xcodebuild") next
+            days = 0
+            if (index(elapsed, "-")) { split(elapsed, part, "-"); days = part[1]; elapsed = part[2] }
+            count = split(elapsed, unit, ":")
+            seconds = 0
+            for (i = 1; i <= count; i++) seconds = seconds * 60 + unit[i]
+            print now - days * 86400 - seconds
+        }'
+}
+
+# One sweep of the testing set, run under its lock. Arguments: dry run (true or
+# false) and the minimum age in seconds. Prints a line per clone and per empty
+# leftover folder (what happened, why, age, UDID, name), then a summary.
+run_clone_sweep() {
+    local dry_run="$1"
+    local min_age="$2"
+    local set_dir="$TEST_DEVICE_SET_DIR"
+    local now
+    local listing
+    local starts
+    local udid
+    local state
+    local name
+    local data_path
+    local folder
+    local changed
+    local born
+    local age
+    local action
+    local reason
+    local files
+    local recent
+    local deleted=0
+    local kept=0
+
+    now="$(date +%s)"
+    [[ -n "${SIMLEASE_SIMCTL:-}" ]] || require_command xcrun
+    if ! listing="$(simctl_tool --set testing list devices -j 2>/dev/null \
+        | jq -r '.devices[][]? | [.udid, .state, .name, (.dataPath // "")] | @tsv')"; then
+        printf 'simlease: cannot list the testing device set (simctl --set testing list devices -j)\n' >&2
+        return 1
+    fi
+    # Without a process list, any clone may belong to a running test: keep them all.
+    starts="$(xcodebuild_start_times)" || starts='0'
+
+    while IFS=$'\t' read -r udid state name data_path; do
+        [[ "$udid" =~ $SIMULATOR_UDID_PATTERN && "$name" =~ $TEST_CLONE_NAME_PATTERN ]] || continue
+        folder="${set_dir}/${udid}"
+        [[ -z "$data_path" ]] || folder="${data_path%/data}"
+        changed="$(newest_mtime "${folder}/device.plist" "$folder")" || changed=""
+        born="$(/usr/bin/stat -f '%B' "$folder" 2>/dev/null)" || born=""
+        age=-1
+        [[ -z "$changed" ]] || age=$(( now - changed ))
+        action='kept'
+        if [[ "$state" != "Shutdown" ]]; then
+            reason="$(printf '%s' "$state" | tr '[:upper:] ' '[:lower:]-')"
+        elif [[ -z "$changed" || -z "$born" ]]; then
+            reason='unreadable'
+        elif [[ "$age" -lt "$min_age" ]]; then
+            reason='recent'
+        elif printf '%s\n' "$starts" | awk -v born="$born" 'NF && $1 <= born + 2 { found = 1 } END { exit !found }'; then
+            # Made after an xcodebuild that still runs started: it may be that run's.
+            reason='xcodebuild-running'
+        elif [[ "$dry_run" == "true" ]]; then
+            action='would-delete'
+            reason='old'
+        elif [[ "$(plutil -extract state raw "${folder}/device.plist" 2>/dev/null || true)" != "1" \
+            || "$(newest_mtime "${folder}/device.plist" "$folder" || true)" != "$changed" ]]; then
+            # A last look right before deleting: it booted or changed meanwhile.
+            reason='changed'
+        elif simctl_tool --set testing delete "$udid" >/dev/null 2>&1; then
+            action='deleted'
+            reason='old'
+        else
+            action='failed'
+            reason='simctl-delete'
+        fi
+        if [[ "$action" == "kept" || "$action" == "failed" ]]; then kept=$(( kept + 1 )); else deleted=$(( deleted + 1 )); fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$action" "$reason" "$(human_age "$age")" "$udid" "$name"
+    done <<< "$listing"
+
+    # UDID folders with no device.plist and no files: what an interrupted
+    # create or delete leaves. A clone being made now already has files.
+    for folder in "$set_dir"/*; do
+        udid="${folder##*/}"
+        [[ "$udid" =~ $SIMULATOR_UDID_PATTERN && -d "$folder" && ! -L "$folder" ]] || continue
+        [[ ! -e "${folder}/device.plist" ]] || continue
+        ! printf '%s\n' "$listing" | grep -q "^${udid}"$'\t' || continue
+        files="$(find "$folder" ! -type d -print -quit 2>/dev/null)" || continue
+        [[ -z "$files" ]] || continue
+        changed="$(find "$folder" -type d -exec /usr/bin/stat -f '%m' {} + 2>/dev/null | sort -n | tail -n 1)" || changed=""
+        age=-1
+        [[ -z "$changed" ]] || age=$(( now - changed ))
+        action='kept'
+        reason='recent'
+        if ! recent="$(find "$folder" -mtime "-${TEST_CLONE_EMPTY_FOLDER_AGE}s" -print -quit 2>/dev/null)" || [[ -n "$recent" ]]; then
+            :
+        elif [[ "$dry_run" == "true" ]]; then
+            action='would-delete'
+            reason='empty'
+        else
+            # Only empty folders go, deepest first; a file that appeared keeps its folders.
+            find "$folder" -depth -type d -empty -delete 2>/dev/null || true
+            if [[ ! -e "$folder" ]]; then action='deleted'; else action='failed'; fi
+            reason='empty'
+        fi
+        if [[ "$action" == "kept" || "$action" == "failed" ]]; then kept=$(( kept + 1 )); else deleted=$(( deleted + 1 )); fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$action" "$reason" "$(human_age "$age")" "$udid" '(empty folder)'
+    done
+
+    if [[ "$deleted" -eq 0 && "$kept" -eq 0 ]]; then
+        printf 'No leftover test clones in %s.\n' "$set_dir"
+    elif [[ "$dry_run" == "true" ]]; then
+        printf 'Would delete %s leftover test clone(s) or folder(s) in %s; %s kept. Nothing was deleted.\n' \
+            "$deleted" "$set_dir" "$kept"
+    else
+        printf 'Deleted %s leftover test clone(s) or folder(s) in %s; %s kept.\n' "$deleted" "$set_dir" "$kept"
+    fi
+}
+
+# simlease sweep-clones: checks the options, then sweeps under the lock.
+sweep_test_clones() {
+    local dry_run=false
+    local min_age="$TEST_CLONE_MIN_AGE"
+    local min_age_seconds
+    local status
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --older-than) [[ $# -ge 2 ]] || fail '--older-than requires a duration'; min_age="$2"; shift 2 ;;
+            --dry-run) dry_run=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) fail "unknown sweep-clones option '$1'" ;;
+        esac
+    done
+    min_age_seconds="$(parse_duration "$min_age")" && [[ "$min_age_seconds" != "off" ]] \
+        || fail "--older-than (or SIMLEASE_TEST_CLONE_MIN_AGE) must be a duration such as 30m or 2h"
+    [[ "$min_age_seconds" -ge 600 ]] \
+        || fail '--older-than must be at least 10m: a younger clone may belong to a test run that is starting'
+    if ! test_clone_sweep_available; then
+        printf 'Skipped: SIMLEASE_DEVICES fakes the Simulators and SIMLEASE_SIMCTL names no fake simctl.\n'
+        return 0
+    fi
+    initialize_directories
+    set +e
+    lockf -k -t 120 "$TEST_CLONE_LOCK_PATH" "$SCRIPT_PATH" __sweep-clones "$dry_run" "$min_age_seconds"
+    status=$?
+    set -e
+    [[ "$status" -ne 75 ]] || fail 'another clone sweep is still running; try again in a few minutes'
+    return "$status"
+}
+
+# After acquire, release and exec: starts a clone sweep in the background,
+# unless one started in the last SIMLEASE_CLONE_SWEEP_INTERVAL. Like the
+# DerivedData sweep, it never fails the command that started it.
+start_clone_sweep() {
+    local interval
+    local stamp_time
+    [[ "${SIMLEASE_CLONE_SWEEP:-1}" != "0" ]] || return 0
+    test_clone_sweep_available || return 0
+    interval="$(parse_duration "$TEST_CLONE_SWEEP_INTERVAL" 2>/dev/null)" || return 0
+    [[ "$interval" != "off" ]] || return 0
+    if [[ -f "$TEST_CLONE_STAMP_PATH" ]]; then
+        stamp_time="$(/usr/bin/stat -f '%m' "$TEST_CLONE_STAMP_PATH" 2>/dev/null || printf '0')"
+        [[ $(( $(date +%s) - stamp_time )) -ge "$interval" ]] || return 0
+    fi
+    ( set -m 2>/dev/null || true; nohup "$SCRIPT_PATH" __sweep-clones-auto </dev/null >/dev/null 2>&1 & ) 2>/dev/null || true
+}
+
+# The background clone sweep: one at a time, quiet unless it deleted or failed
+# something. That goes to the clone sweep log.
+auto_clone_sweep_locked() {
+    local min_age
+    local output
+    min_age="$(parse_duration "$TEST_CLONE_MIN_AGE" 2>/dev/null)" || return 0
+    [[ "$min_age" != "off" && "$min_age" -ge 600 ]] || return 0
+    touch "$TEST_CLONE_STAMP_PATH" 2>/dev/null || true
+    output="$(run_clone_sweep false "$min_age" 2>&1 | grep -E '^(deleted|failed)|^simlease:' || true)"
+    [[ -n "$output" ]] || return 0
+    {
+        printf '%s clone sweep\n' "$(utc_timestamp "$(date +%s)")"
+        printf '%s\n' "$output"
+    } >> "$TEST_CLONE_LOG_PATH" 2>/dev/null || true
+    if [[ "$(wc -l < "$TEST_CLONE_LOG_PATH" 2>/dev/null || printf '0')" -gt 2000 ]]; then
+        if tail -n 1000 "$TEST_CLONE_LOG_PATH" > "${TEST_CLONE_LOG_PATH}.tmp.$$" 2>/dev/null; then
+            mv "${TEST_CLONE_LOG_PATH}.tmp.$$" "$TEST_CLONE_LOG_PATH"
+        else
+            rm -f "${TEST_CLONE_LOG_PATH}.tmp.$$"
+        fi
+    fi
+}
+
 main() {
     require_command install
     require_command jq
@@ -2290,12 +2553,16 @@ main() {
     require_command uuidgen
 
     case "${1:-}" in
-        acquire) shift; acquire_lease "$@"; start_auto_prune ;;
+        acquire) shift; acquire_lease "$@"; start_auto_prune; start_clone_sweep ;;
         status|list) shift; status_leases "$@" ;;
         renew) shift; renew_lease "$@" ;;
-        release) shift; release_lease "$@"; start_auto_prune ;;
+        release) shift; release_lease "$@"; start_auto_prune; start_clone_sweep ;;
         exec) shift; execute_with_lease "$@" ;;
         prune) shift; prune_derived_data "$@" ;;
+        sweep-clones) shift; sweep_test_clones "$@" ;;
+        __sweep-clones) shift; initialize_directories; run_clone_sweep "$@" ;;
+        __sweep-clones-auto) initialize_directories; lockf -t 0 -k "$TEST_CLONE_LOCK_PATH" "$SCRIPT_PATH" __sweep-clones-auto-locked >/dev/null 2>&1 || true ;;
+        __sweep-clones-auto-locked) initialize_directories; auto_clone_sweep_locked ;;
         __prune) shift; initialize_directories; run_prune "$@" ;;
         __auto-prune) initialize_directories; auto_prune ;;
         __auto-prune-locked) initialize_directories; auto_prune_locked ;;

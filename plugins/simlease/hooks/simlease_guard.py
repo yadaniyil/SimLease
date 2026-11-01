@@ -25,8 +25,16 @@ SHELL_SIMULATOR_PATTERN = re.compile(
 # A backslash at the end of a line continues the command on the next line, so
 # the guard reads both as one line. An escaped backslash (`\\`) ends the line.
 LINE_CONTINUATION = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
+# simctl's global options come before the subcommand: `simctl --set testing list`,
+# `simctl --set "my set" delete all`, `simctl --profiles=<path> ...`. Each takes a value.
+SIMCTL_OPTION_VALUE = r"(?:\"[^\"]*\"|'[^']*'|\\.|[^\s;&|()\"'\\])+"
+SIMCTL_GLOBAL_OPTIONS = (
+    r"(?:\s+--(?:set|profiles)(?:=" + SIMCTL_OPTION_VALUE + r"|\s+" + SIMCTL_OPTION_VALUE + r"))*"
+)
 # `xcrun simctl list` and `xcrun simctl help` read nothing but state: no lease needed.
-READ_ONLY_SIMCTL_PATTERN = re.compile(r"\bxcrun\s+simctl\s+(?:list|help)\b", re.IGNORECASE)
+READ_ONLY_SIMCTL_PATTERN = re.compile(
+    r"\bxcrun\s+simctl" + SIMCTL_GLOBAL_OPTIONS + r"\s+(?:list|help)\b", re.IGNORECASE
+)
 SIMLEASE_EXEC_PATTERN = re.compile(r"(?:^|[\s/'\"(])(?:simlease|scripts/simlease)\s+exec\s+--token\b")
 # Read-only text searches may name device commands in their arguments, as in
 # `grep -rn "xcrun simctl" .`. The guard blanks such a search before it matches
@@ -89,11 +97,18 @@ ANDROID_DEVICE_PATTERN = re.compile(
 # Commands that break devices other agents hold, even from inside a lease.
 SHARED_DEVICE_HAZARDS = (
     (
-        re.compile(r"\bsimctl\s+(?:shutdown|erase|delete)\s+all\b"),
-        "SimLease blocked `simctl ... all`: it hits every agent's Simulator. Name your leased UDID.",
+        re.compile(
+            r"\bsimctl" + SIMCTL_GLOBAL_OPTIONS + r"\s+[\"']?(?:shutdown|erase|delete)[\"']?\s+[\"']?all\b"
+        ),
+        "SimLease blocked `simctl ... all`: it hits every agent's Simulator (with `--set testing`, every "
+        "agent's running test clones). Name your leased UDID. `simlease sweep-clones` deletes leftover "
+        "test clones safely.",
     ),
     (
-        re.compile(r"\bsimctl\s+(?!list\b|help\b)[\w-]+\b[^\n;&|]*\bbooted\b"),
+        re.compile(
+            r"\bsimctl" + SIMCTL_GLOBAL_OPTIONS
+            + r"\s+(?!list\b|help\b|--(?:set|profiles)\b)[\w-]+\b[^\n;&|]*\bbooted\b"
+        ),
         "SimLease blocked `simctl ... booted`: with several Simulators booted it picks any of them. "
         "Use the leased UDID (`$SIMULATOR_UDID` inside `simlease exec`).",
     ),

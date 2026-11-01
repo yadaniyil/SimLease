@@ -17,6 +17,10 @@ unset SIMLEASE_DERIVED_DATA_DIR SIMLEASE_DERIVED_DATA_MAX_AGE SIMLEASE_DERIVED_D
 unset SIMLEASE_DERIVED_DATA_KEEP_RECENT SIMLEASE_AUTO_PRUNE_INTERVAL
 # acquire and release start a background prune; only the prune tests turn it on.
 export SIMLEASE_AUTO_PRUNE=0
+# The same goes for the test clone sweep. It never reaches the real testing set:
+# only the clone tests name a fake simctl.
+export SIMLEASE_CLONE_SWEEP=0
+unset SIMLEASE_SIMCTL SIMLEASE_TEST_DEVICE_SET_DIR SIMLEASE_TEST_PS SIMLEASE_TEST_CLONE_MIN_AGE SIMLEASE_CLONE_SWEEP_INTERVAL
 mkdir -p "$SIMLEASE_SERVE_SIM_STATE_DIR" "$SIMLEASE_WORKSPACE"
 
 # macOS /bin/bash 3.2 ignores `set -e` when `[[ ... ]]` fails, so every
@@ -836,5 +840,161 @@ TOKEN_A="$(jq -r '.token' <<<"$AND_A")"
 TOKEN_A=""
 [[ -z "$(ls "$SIMLEASE_ANDROID_TEST_STATE_DIR")" ]] || fail 'emulators are still running after the Android tests'
 unset SIMLEASE_ANDROID_TEST_STATE_DIR SIMLEASE_ANDROID_AVDS SIMLEASE_MAX_EMULATORS ANDROID_AVD_HOME
+
+# sweep-clones: Xcode's testing device set, faked as folders. The fake simctl
+# lists every folder that holds a device.plist, deletes one UDID at a time, and
+# logs every call.
+(
+    CLONE_ROOT="${TEST_ROOT}/clones"
+    export SIMLEASE_DIR="${CLONE_ROOT}/leases"
+    export SIMLEASE_TEST_DEVICE_SET_DIR="${CLONE_ROOT}/XCTestDevices"
+    export SIMLEASE_SIMCTL="${CLONE_ROOT}/simctl"
+    export SIMCTL_CALLS="${CLONE_ROOT}/simctl-calls"
+    # An xcodebuild that started 1 h ago still runs (from a path with a space).
+    export SIMLEASE_TEST_PS=$'    01:00:00 /Applications/Xcode 27.app/Contents/Developer/usr/bin/xcodebuild\n 2-03:00:00 /usr/libexec/logd'
+    mkdir -p "$SIMLEASE_TEST_DEVICE_SET_DIR"
+    : > "$SIMCTL_CALLS"
+    cat > "$SIMLEASE_SIMCTL" <<'SH'
+#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$SIMCTL_CALLS"
+[[ "${1:-}" == "--set" && "${2:-}" == "testing" ]] || exit 64
+shift 2
+set_dir="$SIMLEASE_TEST_DEVICE_SET_DIR"
+case "${1:-}" in
+    list)
+        [[ "$*" == "list devices -j" ]] || exit 64
+        printf "Using Parallel Testing Device Clones Device Set: '%s'\n" "$set_dir" >&2
+        for plist in "$set_dir"/*/device.plist; do
+            [[ -f "$plist" ]] || continue
+            folder="${plist%/device.plist}"
+            case "$(plutil -extract state raw "$plist")" in
+                1) state=Shutdown ;; 2) state=Booting ;; 3) state=Booted ;; 4) state='Shutting Down' ;; *) state=Creating ;;
+            esac
+            jq -n --arg udid "${folder##*/}" --arg state "$state" --arg name "$(plutil -extract name raw "$plist")" \
+                --arg dataPath "${folder}/data" '{udid: $udid, state: $state, name: $name, dataPath: $dataPath, isAvailable: true}'
+        done | jq -s '{devices: {"com.apple.CoreSimulator.SimRuntime.iOS-27-0": .}}'
+        ;;
+    delete)
+        [[ $# -eq 2 && "$2" =~ ^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$ ]] || exit 64
+        rm -rf "${set_dir:?}/$2"
+        ;;
+    *) exit 64 ;;
+esac
+SH
+    chmod +x "$SIMLEASE_SIMCTL"
+    # A device in the set: UDID, name, CoreSimulator state (1 shut down, 2
+    # booting, 3 booted), and how many minutes ago it was made and last changed.
+    fake_set_device() {
+        local folder="${SIMLEASE_TEST_DEVICE_SET_DIR}/$1"
+        mkdir -p "${folder}/data/Library"
+        printf 'x' > "${folder}/data/Library/file"
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>UDID</key><string>%s</string><key>name</key><string>%s</string><key>state</key><integer>%s</integer></dict></plist>\n' \
+            "$1" "$2" "$3" > "${folder}/device.plist"
+        find "$folder" -exec touch -t "$(date -v-"$4"M '+%Y%m%d%H%M.%S')" {} +
+    }
+    # A UDID folder with no device.plist: empty folders only, or one file too.
+    fake_set_folder() {
+        local folder="${SIMLEASE_TEST_DEVICE_SET_DIR}/$1"
+        mkdir -p "${folder}/data/tmp"
+        [[ "${3:-}" != "file" ]] || printf 'x' > "${folder}/data/file"
+        find "$folder" -exec touch -t "$(date -v-"$2"M '+%Y%m%d%H%M.%S')" {} +
+    }
+    # What sweep-clones printed for a UDID, as action/reason, or nothing.
+    clone_state() {
+        awk -F '\t' -v udid="$2" '$4 == udid { print $1 "/" $2 }' <<<"$1"
+    }
+    OLD='A0000000-0000-0000-0000-000000000001'
+    OLDER='A0000000-0000-0000-0000-000000000002'
+    BOOTED='A0000000-0000-0000-0000-000000000003'
+    BOOTING='A0000000-0000-0000-0000-000000000004'
+    RECENT='A0000000-0000-0000-0000-000000000005'
+    RUNNING='A0000000-0000-0000-0000-000000000006'
+    PLAIN='A0000000-0000-0000-0000-000000000007'
+    EMPTY_OLD='A0000000-0000-0000-0000-000000000008'
+    EMPTY_NEW='A0000000-0000-0000-0000-000000000009'
+    WITH_FILE='A0000000-0000-0000-0000-00000000000A'
+    fake_set_device "$OLD" 'Clone 2 of iPhone 1' 1 180
+    fake_set_device "$OLDER" 'Clone 12 of Family Cards shots iPhone' 1 2880
+    fake_set_device "$BOOTED" 'Clone 1 of iPhone 2' 3 180
+    fake_set_device "$BOOTING" 'Clone 1 of iPhone 3' 2 180
+    fake_set_device "$RECENT" 'Clone 2 of iPhone 3' 1 20
+    # Made 45 min ago, after the running xcodebuild started: it may be that run's.
+    fake_set_device "$RUNNING" 'Clone 3 of iPhone 1' 1 45
+    fake_set_device "$PLAIN" 'iPhone 17 Pro' 1 2880
+    fake_set_folder "$EMPTY_OLD" 2880
+    fake_set_folder "$EMPTY_NEW" 120
+    fake_set_folder "$WITH_FILE" 2880 file
+    mkdir -p "${SIMLEASE_TEST_DEVICE_SET_DIR}/not-a-udid"
+
+    "$LEASE_TOOL" sweep-clones --older-than 5m >/dev/null 2>&1 && fail 'sweep-clones accepted --older-than below 10m'
+    "$LEASE_TOOL" sweep-clones --older-than soon >/dev/null 2>&1 && fail 'sweep-clones accepted a duration it cannot read'
+    "$LEASE_TOOL" sweep-clones --all >/dev/null 2>&1 && fail 'sweep-clones accepted an unknown option'
+
+    CLONE_OUTPUT="$("$LEASE_TOOL" sweep-clones --dry-run)"
+    [[ "$(clone_state "$CLONE_OUTPUT" "$OLD")" == 'would-delete/old' ]] || fail 'sweep-clones --dry-run did not list a clone shut down 3 h ago'
+    [[ "$(clone_state "$CLONE_OUTPUT" "$OLDER")" == 'would-delete/old' ]] || fail 'sweep-clones --dry-run did not list a clone shut down 2 days ago'
+    [[ "$(clone_state "$CLONE_OUTPUT" "$EMPTY_OLD")" == 'would-delete/empty' ]] || fail 'sweep-clones --dry-run did not list an old empty folder'
+    grep -q 'Nothing was deleted' <<<"$CLONE_OUTPUT" || fail 'sweep-clones --dry-run did not say that nothing was deleted'
+    ! grep -q ' delete ' "$SIMCTL_CALLS" || fail 'sweep-clones --dry-run called simctl delete'
+    [[ -d "${SIMLEASE_TEST_DEVICE_SET_DIR}/${OLD}" && -d "${SIMLEASE_TEST_DEVICE_SET_DIR}/${EMPTY_OLD}" ]] || fail 'sweep-clones --dry-run deleted something'
+
+    CLONE_OUTPUT="$("$LEASE_TOOL" sweep-clones)"
+    [[ "$(clone_state "$CLONE_OUTPUT" "$OLD")" == 'deleted/old' && ! -e "${SIMLEASE_TEST_DEVICE_SET_DIR}/${OLD}" ]] \
+        || fail 'sweep-clones did not delete a clone shut down 3 h ago'
+    [[ "$(clone_state "$CLONE_OUTPUT" "$OLDER")" == 'deleted/old' && ! -e "${SIMLEASE_TEST_DEVICE_SET_DIR}/${OLDER}" ]] \
+        || fail 'sweep-clones did not delete a clone shut down 2 days ago'
+    [[ "$(clone_state "$CLONE_OUTPUT" "$BOOTED")" == 'kept/booted' && -d "${SIMLEASE_TEST_DEVICE_SET_DIR}/${BOOTED}" ]] \
+        || fail 'sweep-clones touched a booted clone'
+    [[ "$(clone_state "$CLONE_OUTPUT" "$BOOTING")" == 'kept/booting' && -d "${SIMLEASE_TEST_DEVICE_SET_DIR}/${BOOTING}" ]] \
+        || fail 'sweep-clones touched a booting clone'
+    [[ "$(clone_state "$CLONE_OUTPUT" "$RECENT")" == 'kept/recent' && -d "${SIMLEASE_TEST_DEVICE_SET_DIR}/${RECENT}" ]] \
+        || fail 'sweep-clones touched a clone that changed 20 min ago'
+    [[ "$(clone_state "$CLONE_OUTPUT" "$RUNNING")" == 'kept/xcodebuild-running' && -d "${SIMLEASE_TEST_DEVICE_SET_DIR}/${RUNNING}" ]] \
+        || fail 'sweep-clones touched a clone made after a running xcodebuild started'
+    [[ -z "$(clone_state "$CLONE_OUTPUT" "$PLAIN")" && -d "${SIMLEASE_TEST_DEVICE_SET_DIR}/${PLAIN}" ]] \
+        || fail 'sweep-clones touched a device that is not a clone'
+    [[ "$(clone_state "$CLONE_OUTPUT" "$EMPTY_OLD")" == 'deleted/empty' && ! -e "${SIMLEASE_TEST_DEVICE_SET_DIR}/${EMPTY_OLD}" ]] \
+        || fail 'sweep-clones did not remove an empty folder 2 days old'
+    [[ "$(clone_state "$CLONE_OUTPUT" "$EMPTY_NEW")" == 'kept/recent' && -d "${SIMLEASE_TEST_DEVICE_SET_DIR}/${EMPTY_NEW}/data/tmp" ]] \
+        || fail 'sweep-clones removed an empty folder 2 h old'
+    [[ -z "$(clone_state "$CLONE_OUTPUT" "$WITH_FILE")" && -f "${SIMLEASE_TEST_DEVICE_SET_DIR}/${WITH_FILE}/data/file" ]] \
+        || fail 'sweep-clones touched a folder with a file in it'
+    [[ -d "${SIMLEASE_TEST_DEVICE_SET_DIR}/not-a-udid" ]] || fail 'sweep-clones touched a folder that is not a UDID'
+    # Every delete names one UDID; nothing ever deletes "all".
+    [[ "$(grep -c ' delete ' "$SIMCTL_CALLS")" -eq 2 ]] || fail 'sweep-clones did not call simctl delete once per old clone'
+    grep -qx -- "--set testing delete ${OLD}" "$SIMCTL_CALLS" || fail 'sweep-clones did not delete through simctl --set testing delete <UDID>'
+    grep -qx -- "--set testing delete ${OLDER}" "$SIMCTL_CALLS" || fail 'sweep-clones did not delete through simctl --set testing delete <UDID>'
+    ! grep -q 'all' "$SIMCTL_CALLS" || fail 'sweep-clones called simctl with all'
+
+    # Once that xcodebuild has ended, its clone goes.
+    CLONE_OUTPUT="$(SIMLEASE_TEST_PS='' "$LEASE_TOOL" sweep-clones)"
+    [[ "$(clone_state "$CLONE_OUTPUT" "$RUNNING")" == 'deleted/old' ]] || fail 'sweep-clones kept a clone after its xcodebuild ended'
+
+    # The tests' fake Simulators never reach the real testing set.
+    [[ "$(SIMLEASE_SIMCTL='' "$LEASE_TOOL" sweep-clones)" == Skipped:* ]] || fail 'sweep-clones ran with fake Simulators and no fake simctl'
+
+    # acquire and release sweep in the background, at most once every
+    # SIMLEASE_CLONE_SWEEP_INTERVAL, and log what they delete.
+    SWEPT='A0000000-0000-0000-0000-00000000000B'
+    fake_set_device "$SWEPT" 'Clone 2 of iPhone 2' 1 180
+    CLONE_LEASE="$("$LEASE_TOOL" acquire --owner clone-sweep --ttl 30 --json)"
+    SIMLEASE_CLONE_SWEEP=1 SIMLEASE_CLONE_SWEEP_INTERVAL=0 "$LEASE_TOOL" release --token "$(jq -r '.token' <<<"$CLONE_LEASE")" >/dev/null
+    for _ in $(seq 1 100); do
+        grep -q "deleted	old	.*	${SWEPT}	Clone 2 of iPhone 2" "${SIMLEASE_DIR}/test-clone-sweep.log" 2>/dev/null && break
+        sleep 0.1
+    done
+    [[ ! -e "${SIMLEASE_TEST_DEVICE_SET_DIR}/${SWEPT}" ]] || fail 'release did not sweep an old clone in the background'
+    grep -q "deleted	old	.*	${SWEPT}	Clone 2 of iPhone 2" "${SIMLEASE_DIR}/test-clone-sweep.log" \
+        || fail 'the background clone sweep did not log what it deleted'
+    ! grep -q -e 'kept' -e "$BOOTED" "${SIMLEASE_DIR}/test-clone-sweep.log" || fail 'the background clone sweep logged a clone it kept'
+    # Wait for that sweep to finish before the next clone appears.
+    lockf -t 10 "${SIMLEASE_DIR}/locks/test-clone-sweep.lock" true || fail 'the background clone sweep did not finish'
+    fake_set_device "$SWEPT" 'Clone 2 of iPhone 2' 1 180
+    CLONE_LEASE="$(SIMLEASE_CLONE_SWEEP=1 SIMLEASE_CLONE_SWEEP_INTERVAL=1h "$LEASE_TOOL" acquire --owner clone-sweep --ttl 30 --json)"
+    SIMLEASE_CLONE_SWEEP=1 SIMLEASE_CLONE_SWEEP_INTERVAL=1h "$LEASE_TOOL" release --token "$(jq -r '.token' <<<"$CLONE_LEASE")" >/dev/null
+    sleep 2
+    [[ -d "${SIMLEASE_TEST_DEVICE_SET_DIR}/${SWEPT}" ]] || fail 'a background clone sweep ran again within SIMLEASE_CLONE_SWEEP_INTERVAL'
+)
 
 printf 'simulator lease tests passed\n'
