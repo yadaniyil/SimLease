@@ -41,6 +41,8 @@ Before the first device operation in a task, run `scripts/preflight`. If it fail
 
    For one test or a few (`-only-testing:…`), add `-parallel-testing-enabled NO`. A short parallel run can exit while xcodebuild is still making a "Clone 2 of …" Simulator, and that clone stays in `~/Library/Developer/XCTestDevices`. SimLease deletes such leftovers itself; `scripts/simlease sweep-clones --dry-run` lists them.
 
+   With `--keep-services widgets`, every boot adds 150-600 MB of wallpaper previews that iOS never deletes. SimLease deletes them itself whenever a Simulator is shut down (at release, before a boot, and for idle ones). To clean by hand, shut the leased Simulator down inside the lease, then `scripts/simlease clean-posters --token-file '<scratch>/sim.token'`.
+
 6. `exec` keeps the lease alive while its command runs. For work outside `exec`, renew by hand: `scripts/simlease renew --token-file '<scratch>/sim.token' --ttl 3600`.
 7. Release in cleanup, including after failures: `scripts/simlease release --token-file '<scratch>/sim.token'`.
 

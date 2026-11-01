@@ -28,6 +28,7 @@ SimLease is one Bash CLI plus an optional guard hook. It uses macOS `lockf` kern
 - [Commands](#commands)
 - [Derived Data](#derived-data)
 - [Test clones](#test-clones)
+- [Wallpaper caches](#wallpaper-caches)
 - [Slim Simulators](#slim-simulators)
 - [Android emulators](#android-emulators)
 - [Guard hooks](#guard-hooks)
@@ -139,6 +140,7 @@ simlease release (--token TOKEN | --token-file PATH) [--json]
 simlease exec    (--token TOKEN | --token-file PATH) -- COMMAND [ARG ...]
 simlease prune   [--older-than DUR] [--max-total SIZE] [--dry-run] [--dir FOLDER]   old Derived Data
 simlease sweep-clones [--older-than DUR] [--dry-run]                              leftover test clones
+simlease clean-posters [--token TOKEN | --token-file PATH] [--min-size SIZE] [--dry-run]   wallpaper caches
 ```
 
 Options for both platforms:
@@ -249,6 +251,28 @@ simlease sweep-clones --older-than 2h    # wait longer (at least 10m)
 
 It prints one line per clone: what happened (`deleted`, `would-delete`, `kept`, `failed`), why (`old`, `empty`, `recent`, `xcodebuild-running`, `changed`, or the state, such as `booted`), the age, the UDID and the name. `SIMLEASE_CLONE_SWEEP=0` turns the background sweep off.
 
+## Wallpaper caches
+
+iOS (PosterBoard) keeps preview pictures of every wallpaper in `scratch/SnapshotCache.cachedb` folders under `data/Library/Application Support/PRBPosterExtensionDataStore/<n>/Extensions/`. With the widgets services on (`--keep-services widgets`), every boot draws a whole new set, 150-600 MB, and iOS never deletes the old ones. One iPad reached 22 GB after 38 boots.
+
+simlease deletes these caches, and the `PRPosterRole*-index.json` files that point into them. iOS draws the previews again when it needs them. The chosen wallpaper stays: its settings and its lock and home screen pictures (`RuntimeSnapshot-*.atx`) are not caches.
+
+- **Only shut down.** PosterBoard writes the caches while the Simulator runs. A Simulator counts as shut down when its `device.plist` says so and no `launchd_sim` runs for it.
+- **Automatic, above 100 MB.** A Simulator simlease shut down at release; one it is about to boot at acquire; and, in a background sweep after `acquire` and `release` (at most once every 10 minutes), every idle one. The sweep takes each Simulator's lock, so no lease can boot it meanwhile, and skips leased and pinned ones. A pinned Simulator is cleaned only when someone leases it.
+- **All or nothing.** The index files and caches move into a trash folder first, then the trash goes. Removals are logged in `${TMPDIR}/simlease/poster-cache.log`; a clean with nothing to do writes nothing.
+
+By hand:
+
+```bash
+# The leased Simulator. Shut it down inside the lease first.
+simlease exec --token-file "$SCRATCH/sim.token" -- sh -c 'xcrun simctl shutdown "$SIMULATOR_UDID"'
+simlease clean-posters --token-file "$SCRATCH/sim.token" [--dry-run]
+# Every shut-down Simulator no lease holds (pinned ones skipped).
+simlease clean-posters --dry-run
+```
+
+It prints one line per Simulator: what happened (`cleaned`, `would-clean`, `kept`, `failed`), why (`wallpaper-cache`, `small`, `booted`, `leased`, `pinned`), the size, the UDID, the name and how many caches and index files. `--min-size SIZE` (default 0) leaves a Simulator with less alone. `SIMLEASE_POSTER_CLEAN=0` turns the automatic cleaning off.
+
 ## Slim Simulators
 
 When `simslim` is on `PATH`, every iOS acquire makes the leased Simulator match one shared profile, `~/.config/simlease/simslim-profile.json`:
@@ -334,7 +358,8 @@ Many agents share this Mac's devices. `simlease` leases every Simulator and emul
   `top --json`, `disk-plan`). To check features, run `simslim doctor "$SIMULATOR_UDID" --requires <features>`
   inside `simlease exec`.
   One test or a few (`xcodebuild … -only-testing:…`): add `-parallel-testing-enabled NO`, or a short run can
-  leave a "Clone 2 of …" Simulator behind. simlease deletes leftover test clones.
+  leave a "Clone 2 of …" Simulator behind. simlease deletes leftover test clones, and wallpaper caches
+  (with `--keep-services widgets`, every boot adds 150-600 MB).
 - Android: `simlease acquire --avd <AVD> --owner <task> --wait 900 --token-file <scratch>/emu.token --json`
   boots your own read-only instance. Then `simlease exec --token-file … -- adb …` or
   `-- sh -c 'flutter run -d "$ANDROID_SERIAL"'`.
@@ -385,6 +410,9 @@ A previously started `serve-sim` helper doesn't reserve its Simulator. `status` 
 | `SIMLEASE_CLONE_SWEEP_INTERVAL` | `10m` | At most one background clone sweep per interval. |
 | `SIMLEASE_TEST_CLONE_MIN_AGE` | `30m` | A clone must be unchanged this long before it goes. At least `10m`. |
 | `SIMLEASE_TEST_DEVICE_SET_DIR` | `~/Library/Developer/XCTestDevices` | Where the sweep looks for empty leftover folders. |
+| `SIMLEASE_POSTER_CLEAN` | `1` | `0` turns off the automatic [wallpaper cache](#wallpaper-caches) cleaning. |
+| `SIMLEASE_POSTER_CACHE_MIN` | `100M` | Automatic cleaning leaves a Simulator with less cache than this alone. |
+| `SIMLEASE_POSTER_SWEEP_INTERVAL` | `10m` | At most one background wallpaper cache sweep per interval. |
 | `SIMLEASE_CONFIG_DIR` | `~/.config/simlease` | Where the profile and pinned list live. |
 
 ## Requirements

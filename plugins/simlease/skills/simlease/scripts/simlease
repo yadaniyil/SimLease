@@ -49,10 +49,27 @@ TEST_CLONE_NAME_PATTERN='^Clone [0-9]+ of .'
 TEST_CLONE_EMPTY_FOLDER_AGE=86400
 TEST_CLONE_STAMP_PATH="${LEASE_ROOT}/test-clone-sweep.stamp"
 TEST_CLONE_LOG_PATH="${LEASE_ROOT}/test-clone-sweep.log"
+# PosterBoard caches wallpaper preview pictures in PRBPosterExtensionDataStore/
+# <n>/Extensions/<extension>/<kind>/<id>/versions/<v>/scratch/SnapshotCache.cachedb.
+# With the widgets services on (--keep-services widgets), every boot draws a new
+# set (150-600 MB) and iOS never deletes the old ones: one iPad reached 22 GB.
+# simlease deletes these caches, and the index files that point into them,
+# while the Simulator is shut down. iOS draws them again when it needs them. The
+# chosen wallpaper (its configuration files and lock/home screen pictures) stays.
+SIMULATOR_DEVICES_DIR="${SIMLEASE_TEST_SIMULATOR_DEVICES_DIR:-${HOME}/Library/Developer/CoreSimulator/Devices}"
+POSTER_STORE='data/Library/Application Support/PRBPosterExtensionDataStore'
+POSTER_TRASH='data/Library/Application Support/.simlease-poster-trash'
+POSTER_CACHE_PATTERN='*/Extensions/*/*/*/versions/*/scratch/SnapshotCache.cachedb'
+# Automatic cleaning leaves a Simulator alone below this much cache.
+POSTER_CACHE_MIN="${SIMLEASE_POSTER_CACHE_MIN:-100M}"
+POSTER_SWEEP_INTERVAL="${SIMLEASE_POSTER_SWEEP_INTERVAL:-10m}"
+POSTER_STAMP_PATH="${LEASE_ROOT}/poster-cache-sweep.stamp"
+POSTER_LOG_PATH="${LEASE_ROOT}/poster-cache.log"
 RUNTIME_ROOT="${SIMLEASE_RUNTIME_DIR:-${TMPDIR:-/tmp}/simlease-runtime}"
 POOL_LOCK_PATH="${LOCK_DIR}/pool.lock"
 PRUNE_LOCK_PATH="${LOCK_DIR}/derived-data-prune.lock"
 TEST_CLONE_LOCK_PATH="${LOCK_DIR}/test-clone-sweep.lock"
+POSTER_LOCK_PATH="${LOCK_DIR}/poster-cache-sweep.lock"
 SERVE_SIM_STATE_DIR="${SIMLEASE_SERVE_SIM_STATE_DIR:-${TMPDIR:-/tmp}/serve-sim}"
 DEFAULT_TTL_SECONDS="${SIMLEASE_TTL_SECONDS:-3600}"
 MIN_FREE_MEMORY_MB="${SIMLEASE_MIN_FREE_MEMORY_MB:-4096}"
@@ -87,6 +104,7 @@ Usage:
   simlease exec --token TOKEN -- COMMAND [ARG ...]
   simlease prune [--older-than DURATION] [--max-total SIZE] [--dry-run] [--dir FOLDER]
   simlease sweep-clones [--older-than DURATION] [--dry-run]
+  simlease clean-posters [--token TOKEN | --token-file PATH] [--min-size SIZE] [--dry-run]
 
 renew, release and exec also take --token-file PATH in place of --token TOKEN.
 exec keeps renewing the lease while COMMAND runs, so a long run outlives the TTL.
@@ -155,6 +173,21 @@ A UDID folder there with no device.plist and no files goes after a day.
 most once every 10m (SIMLEASE_CLONE_SWEEP_INTERVAL; SIMLEASE_CLONE_SWEEP=0 turns
 it off); what it deletes goes to SIMLEASE_DIR/test-clone-sweep.log. Pass
 -parallel-testing-enabled NO to a single-test xcodebuild run: it makes no clones.
+
+clean-posters deletes iOS wallpaper preview caches (PosterBoard's
+scratch/SnapshotCache.cachedb folders and the *-index.json files that point
+into them). With the widgets services on, every boot adds a new set of
+150-600 MB and iOS never deletes the old ones. It works only on a shut-down
+Simulator and never touches the chosen wallpaper or its settings; iOS draws the
+previews again when it needs them. With a token it cleans the leased Simulator
+(shut it down inside the lease first). Without one it cleans every shut-down
+Simulator no lease holds, skipping pinned ones. --min-size (default 0) leaves a
+Simulator with less cache alone; --dry-run only lists. simlease also cleans
+automatically, above 100M (SIMLEASE_POSTER_CACHE_MIN): a Simulator it shuts down
+at release, one it is about to boot at acquire, and, in the background after
+acquire and release at most once every 10m (SIMLEASE_POSTER_SWEEP_INTERVAL),
+every idle one. SIMLEASE_POSTER_CLEAN=0 turns that off. What it deletes goes to
+SIMLEASE_DIR/poster-cache.log.
 
 SIMLEASE_DIR overrides the shared state directory.
 SIMLEASE_DERIVED_DATA_DIR puts every project's DerivedData under that folder
@@ -894,6 +927,7 @@ cleanup_stale_metadata_under_lock() {
     local current_token_hash
     local guard_label
     local booted_by_simlease
+    local device_name
 
     metadata="$(metadata_path_for_udid "$udid")"
     [[ -f "$metadata" ]] || return 0
@@ -904,11 +938,15 @@ cleanup_stale_metadata_under_lock() {
     fi
     guard_label="$(jq -r '.guardLabel // empty' "$metadata" 2>/dev/null || true)"
     booted_by_simlease="$(jq -r '.bootedBySimLease // false' "$metadata" 2>/dev/null || printf 'false')"
+    device_name="$(jq -r '.deviceName // empty' "$metadata" 2>/dev/null || true)"
     if [[ "$booted_by_simlease" == "true" ]]; then
         shutdown_device "$udid"
     fi
     rm -f "$metadata"
     remove_launchd_job "$guard_label"
+    if [[ "$booted_by_simlease" == "true" ]]; then
+        clean_posters_now "$udid" "$device_name" release || true
+    fi
 }
 
 find_metadata_by_token_hash() {
@@ -991,15 +1029,22 @@ guard_cleanup() {
     local acknowledged_file="$4"
     local release_file="$5"
     local udid
+    local device_name
     local booted_by_simlease
 
     if [[ -f "$metadata" ]] && jq -e --arg tokenHash "$hashed_token" '.tokenHash == $tokenHash' "$metadata" >/dev/null 2>&1; then
         udid="$(jq -r '.udid' "$metadata")"
+        device_name="$(jq -r '.deviceName // empty' "$metadata")"
         booted_by_simlease="$(jq -r '.bootedBySimLease // false' "$metadata")"
         if [[ "$booted_by_simlease" == "true" ]]; then
             shutdown_device "$udid"
         fi
         rm -f "$metadata"
+        # release returns once the metadata is gone. This guard still holds the
+        # Simulator's lock, so no new lease can boot it while its caches go.
+        if [[ "$booted_by_simlease" == "true" ]]; then
+            clean_posters_now "$udid" "$device_name" release || true
+        fi
     fi
     rm -f "$ready_file" "$acknowledged_file" "$release_file"
 }
@@ -1039,6 +1084,8 @@ guard_lease() {
         "$guard_label"
 
     if [[ "$booted_by_simlease" == "true" ]]; then
+        # Still shut down: the moment to clear its wallpaper caches.
+        clean_posters_now "$udid" "$device_name" boot || true
         boot_device "$udid" "$device_name" || exit 1
         jq '.lifecycleState = "leased"' "$metadata" > "${metadata}.booted.$$"
         mv "${metadata}.booted.$$" "$metadata"
@@ -1127,10 +1174,15 @@ try_acquire_device() {
 
     guard_environment=(
         "PATH=${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+        "HOME=${HOME}"
         "SIMLEASE_DIR=${LEASE_ROOT}"
         "SIMLEASE_WORKSPACE=${PROJECT_ROOT}"
         "SIMLEASE_RUNTIME_DIR=${RUNTIME_ROOT}"
+        "SIMLEASE_POSTER_CLEAN=${SIMLEASE_POSTER_CLEAN:-1}"
+        "SIMLEASE_POSTER_CACHE_MIN=${POSTER_CACHE_MIN}"
     )
+    [[ -z "${SIMLEASE_TEST_SIMULATOR_DEVICES_DIR:-}" ]] \
+        || guard_environment+=("SIMLEASE_TEST_SIMULATOR_DEVICES_DIR=${SIMLEASE_TEST_SIMULATOR_DEVICES_DIR}")
     if [[ -n "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]]; then
         guard_environment+=("SIMLEASE_TEST_DEVICE_STATE_DIR=${SIMLEASE_TEST_DEVICE_STATE_DIR}")
         guard_environment+=("SIMLEASE_TEST_BOOT_DELAY_SECONDS=${SIMLEASE_TEST_BOOT_DELAY_SECONDS:-0}")
@@ -2544,6 +2596,318 @@ auto_clone_sweep_locked() {
     fi
 }
 
+# Keeps a log short: the last 1000 lines once it passes 2000.
+trim_log() {
+    [[ "$(wc -l < "$1" 2>/dev/null || printf '0')" -gt 2000 ]] || return 0
+    if tail -n 1000 "$1" > "${1}.tmp.$$" 2>/dev/null; then
+        mv "${1}.tmp.$$" "$1"
+    else
+        rm -f "${1}.tmp.$$"
+    fi
+}
+
+# The tests fake every Simulator (SIMLEASE_DEVICES, SIMLEASE_SHUTDOWN_DEVICES,
+# a fake boot state): they never reach the real device folders unless they name
+# fake ones too.
+poster_clean_available() {
+    [[ -n "${SIMLEASE_TEST_SIMULATOR_DEVICES_DIR:-}" ]] \
+        || [[ -z "${SIMLEASE_DEVICES:-}${SIMLEASE_SHUTDOWN_DEVICES:-}${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" ]]
+}
+
+# True while a Simulator is shut down: CoreSimulator says so (state 1 in its
+# device.plist) and no launchd_sim runs for it.
+simulator_is_shut_down() {
+    local udid="$1"
+    if [[ -n "${SIMLEASE_TEST_DEVICE_STATE_DIR:-}" && -f "${SIMLEASE_TEST_DEVICE_STATE_DIR}/${udid}.booted" ]]; then
+        return 1
+    fi
+    [[ "$(plutil -extract state raw "${SIMULATOR_DEVICES_DIR}/${udid}/device.plist" 2>/dev/null || true)" == "1" ]] || return 1
+    ! pgrep -f "launchd_sim.*${udid}" >/dev/null 2>&1
+}
+
+# Waits up to $2 seconds for a Simulator to finish shutting down.
+wait_until_shut_down() {
+    local deadline=$(( $(date +%s) + $2 ))
+    until simulator_is_shut_down "$1"; do
+        [[ "$(date +%s)" -lt "$deadline" ]] || return 1
+        sleep 0.5
+    done
+}
+
+# Each wallpaper cache of a Simulator that holds anything, as "<KiB>\t<path>",
+# then the same for the trash an interrupted clean left. Empty caches stay out.
+poster_cache_listing() {
+    local device="${SIMULATOR_DEVICES_DIR}/$1"
+    local store="${device}/${POSTER_STORE}"
+    local trash="${device}/${POSTER_TRASH}"
+    local folders=""
+    if [[ -d "$store" ]]; then
+        folders="$(find "$store" -mindepth 9 -maxdepth 9 -type d -name SnapshotCache.cachedb \
+            -path "$POSTER_CACHE_PATTERN" 2>/dev/null || true)"
+    fi
+    if [[ -n "$folders" ]]; then
+        printf '%s\n' "$folders" | tr '\n' '\0' | xargs -0 du -sk 2>/dev/null | awk -F '\t' '$1 > 0' || true
+    fi
+    if [[ -d "$trash" ]]; then
+        du -sk "$trash" 2>/dev/null || true
+    fi
+}
+
+# Cleans one Simulator's wallpaper caches. The caller holds the Simulator: its
+# lease, or its lock. Arguments: UDID, name, dry run (true or false) and the
+# least cache in KiB worth cleaning. Prints action, reason, size, UDID, name and
+# what it found, tab-separated; nothing when the Simulator has no cache at all.
+# Everything moves into a trash folder first, the index files before the
+# caches, and the trash goes last: iOS never sees half a cache.
+clean_poster_cache() {
+    local udid="$1"
+    local name="$2"
+    local dry_run="$3"
+    local min_kb="$4"
+    local device="${SIMULATOR_DEVICES_DIR}/${udid}"
+    local store="${device}/${POSTER_STORE}"
+    local trash="${device}/${POSTER_TRASH}"
+    local listing
+    local total_kb
+    local caches
+    local indexes=""
+    local index_count=0
+    local action='cleaned'
+    local reason='wallpaper-cache'
+    local path
+    local moved=0
+
+    [[ "$udid" =~ $SIMULATOR_UDID_PATTERN ]] || return 0
+    listing="$(poster_cache_listing "$udid")"
+    [[ -n "$listing" ]] || return 0
+    total_kb="$(printf '%s\n' "$listing" | awk -F '\t' '{ total += $1 } END { print total + 0 }')"
+    caches="$(printf '%s\n' "$listing" | awk -F '\t' -v trash="$trash" 'NF && $2 != trash { count++ } END { print count + 0 }')"
+    if [[ "$caches" -gt 0 ]]; then
+        indexes="$(find "$store" -mindepth 2 -maxdepth 2 -type f -name 'PRPosterRole*-index.json' 2>/dev/null || true)"
+        [[ -z "$indexes" ]] || index_count="$(printf '%s\n' "$indexes" | awk 'END { print NR }')"
+    fi
+
+    if [[ "$total_kb" -lt "$min_kb" ]]; then
+        action='kept'; reason='small'
+    elif ! simulator_is_shut_down "$udid"; then
+        action='kept'; reason='booted'
+    elif [[ "$dry_run" == "true" ]]; then
+        action='would-clean'
+    else
+        if ! ( umask 077; mkdir -p "$trash" ) 2>/dev/null; then
+            action='failed'; reason='trash'
+        else
+            while IFS= read -r path; do
+                [[ -n "$path" ]] || continue
+                moved=$(( moved + 1 ))
+                mv "$path" "${trash}/$$-${moved}" 2>/dev/null || { action='failed'; reason='move'; }
+            done <<< "$indexes"
+            while IFS=$'\t' read -r _ path; do
+                [[ -n "$path" && "$path" != "$trash" ]] || continue
+                moved=$(( moved + 1 ))
+                mv "$path" "${trash}/$$-${moved}" 2>/dev/null || { action='failed'; reason='move'; }
+            done <<< "$listing"
+            rm -rf -- "$trash" 2>/dev/null || true
+            if [[ -e "$trash" && "$action" == "cleaned" ]]; then
+                action='failed'; reason='delete'
+            fi
+        fi
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s caches, %s index files\n' \
+        "$action" "$reason" "$(human_size "$total_kb")" "$udid" "$name" "$caches" "$index_count"
+}
+
+# Appends what a clean deleted, or failed to, to the wallpaper cache log.
+log_poster_clean() {
+    local why="$1"
+    local output
+    output="$(printf '%s\n' "$2" | grep -E $'^(cleaned|failed)\t' || true)"
+    [[ -n "$output" ]] || return 0
+    {
+        printf '%s %s\n' "$(utc_timestamp "$(date +%s)")" "$why"
+        printf '%s\n' "$output"
+    } >> "$POSTER_LOG_PATH" 2>/dev/null || true
+    trim_log "$POSTER_LOG_PATH"
+}
+
+# The automatic clean of a Simulator simlease just shut down (release) or is
+# about to boot (boot). The caller holds the Simulator. Quiet; never fails.
+clean_posters_now() {
+    local udid="$1"
+    local name="$2"
+    local why="$3"
+    local min_kb
+    local output
+    [[ "${SIMLEASE_POSTER_CLEAN:-1}" != "0" ]] || return 0
+    ! is_android_id "$udid" || return 0
+    poster_clean_available || return 0
+    min_kb="$(parse_size_kb "$POSTER_CACHE_MIN" 2>/dev/null)" || return 0
+    [[ "$min_kb" != "off" ]] || return 0
+    [[ -n "$(poster_cache_listing "$udid")" ]] || return 0
+    # simctl shutdown can return a moment before CoreSimulator records it.
+    if [[ "$why" == "release" ]]; then
+        wait_until_shut_down "$udid" 15 || return 0
+    fi
+    output="$(clean_poster_cache "$udid" "$name" false "$min_kb" 2>&1)" || true
+    log_poster_clean "$why" "$output"
+}
+
+# One pass over every Simulator in the device set. Arguments: dry run and the
+# least cache in KiB. Each one is cleaned under its own lock, so no lease can
+# boot it meanwhile. Leased, booted and pinned Simulators are left alone. Prints
+# a line per Simulator with caches, then a summary.
+run_poster_sweep() {
+    local dry_run="$1"
+    local min_kb="$2"
+    local folder
+    local udid
+    local name
+    local listing
+    local kb
+    local line
+    local status
+    local done_count=0
+    local done_kb=0
+    local kept=0
+
+    for folder in "$SIMULATOR_DEVICES_DIR"/*; do
+        udid="${folder##*/}"
+        [[ "$udid" =~ $SIMULATOR_UDID_PATTERN && -f "${folder}/device.plist" && ! -L "$folder" ]] || continue
+        listing="$(poster_cache_listing "$udid")"
+        [[ -n "$listing" ]] || continue
+        kb="$(printf '%s\n' "$listing" | awk -F '\t' '{ total += $1 } END { print total + 0 }')"
+        name="$(plutil -extract name raw "${folder}/device.plist" 2>/dev/null || printf '%s' "$udid")"
+        line=""
+        if is_pinned "$udid"; then
+            line=$'kept\tpinned'
+        elif [[ "$kb" -lt "$min_kb" ]]; then
+            line=$'kept\tsmall'
+        elif ! simulator_is_shut_down "$udid"; then
+            line=$'kept\tbooted'
+        else
+            set +e
+            line="$(lockf -t 0 -k "$(lock_path_for_udid "$udid")" \
+                "$SCRIPT_PATH" __clean-posters-device "$udid" "$name" "$dry_run" "$min_kb" 2>/dev/null)"
+            status=$?
+            set -e
+            if [[ "$status" -eq 75 ]]; then
+                line=$'kept\tleased'
+            elif [[ "$status" -ne 0 || -z "$line" ]]; then
+                line=$'failed\terror'
+            fi
+        fi
+        if [[ "$line" == *$'\t'*$'\t'*$'\t'* ]]; then
+            printf '%s\n' "$line"
+        else
+            printf '%s\t%s\t%s\t%s\t-\n' "$line" "$(human_size "$kb")" "$udid" "$name"
+        fi
+        case "$line" in
+            cleaned*|would-clean*) done_count=$(( done_count + 1 )); done_kb=$(( done_kb + kb )) ;;
+            *) kept=$(( kept + 1 )) ;;
+        esac
+    done
+
+    if [[ "$done_count" -eq 0 && "$kept" -eq 0 ]]; then
+        printf 'No wallpaper caches in %s.\n' "$SIMULATOR_DEVICES_DIR"
+    elif [[ "$dry_run" == "true" ]]; then
+        printf 'Would clean %s Simulator(s), %s; %s kept. Nothing was deleted.\n' "$done_count" "$(human_size "$done_kb")" "$kept"
+    else
+        printf 'Cleaned %s Simulator(s), %s; %s kept.\n' "$done_count" "$(human_size "$done_kb")" "$kept"
+    fi
+}
+
+# simlease clean-posters: the leased Simulator with a token, else every idle one.
+clean_posters_command() {
+    local token=""
+    local dry_run=false
+    local min_size='0'
+    local min_kb
+    local metadata
+    local udid
+    local name
+    local output
+    local status
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --token) [[ $# -ge 2 ]] || fail '--token requires a value'; token="$2"; shift 2 ;;
+            --token-file) [[ $# -ge 2 ]] || fail '--token-file requires a path'; token="$(token_from_file "$2")" || exit 1; shift 2 ;;
+            --min-size) [[ $# -ge 2 ]] || fail '--min-size requires a size'; min_size="$2"; shift 2 ;;
+            --dry-run) dry_run=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) fail "unknown clean-posters option '$1'" ;;
+        esac
+    done
+    min_kb="$(parse_size_kb "$min_size")" && [[ "$min_kb" != "off" ]] \
+        || fail '--min-size must be a size such as 0, 500M or 2G'
+    if ! poster_clean_available; then
+        printf 'Skipped: the Simulators are fake (SIMLEASE_DEVICES) and SIMLEASE_TEST_SIMULATOR_DEVICES_DIR names no fake device folders.\n'
+        return 0
+    fi
+    initialize_directories
+    if [[ -z "$token" ]]; then
+        set +e
+        lockf -k -t 120 "$POSTER_LOCK_PATH" "$SCRIPT_PATH" __clean-posters-sweep "$dry_run" "$min_kb"
+        status=$?
+        set -e
+        [[ "$status" -ne 75 ]] || fail 'another wallpaper cache sweep is still running; try again in a few minutes'
+        return "$status"
+    fi
+
+    if ! metadata="$(find_metadata_by_token_hash "$(token_hash "$token")")" || ! metadata_guard_is_alive "$metadata"; then
+        fail 'lease token is invalid or no longer active'
+    fi
+    udid="$(jq -r '.udid' "$metadata")"
+    name="$(jq -r '.deviceName' "$metadata")"
+    ! is_android_id "$udid" || fail 'clean-posters is for Simulators; an emulator lease has no wallpaper caches'
+    simulator_is_shut_down "$udid" \
+        || fail "${name} is booted. Shut it down inside the lease first: simlease exec --token-file FILE -- sh -c 'xcrun simctl shutdown \"\$SIMULATOR_UDID\"'"
+    output="$(clean_poster_cache "$udid" "$name" "$dry_run" "$min_kb")"
+    if [[ -z "$output" ]]; then
+        printf 'No wallpaper caches on %s.\n' "$name"
+        return 0
+    fi
+    printf '%s\n' "$output"
+    log_poster_clean 'clean-posters' "$output"
+    [[ "$output" != failed* ]]
+}
+
+# clean-posters with no token: one pass under the sweep lock, logged.
+hand_poster_sweep() {
+    local output
+    output="$(run_poster_sweep "$1" "$2")"
+    printf '%s\n' "$output"
+    log_poster_clean 'clean-posters' "$output"
+}
+
+# After acquire and release: starts a wallpaper cache sweep in the background,
+# unless one started in the last SIMLEASE_POSTER_SWEEP_INTERVAL. It never
+# fails the command that started it.
+start_poster_sweep() {
+    local interval
+    local stamp_time
+    [[ "${SIMLEASE_POSTER_CLEAN:-1}" != "0" ]] || return 0
+    poster_clean_available || return 0
+    interval="$(parse_duration "$POSTER_SWEEP_INTERVAL" 2>/dev/null)" || return 0
+    [[ "$interval" != "off" ]] || return 0
+    if [[ -f "$POSTER_STAMP_PATH" ]]; then
+        stamp_time="$(/usr/bin/stat -f '%m' "$POSTER_STAMP_PATH" 2>/dev/null || printf '0')"
+        [[ $(( $(date +%s) - stamp_time )) -ge "$interval" ]] || return 0
+    fi
+    ( set -m 2>/dev/null || true; nohup "$SCRIPT_PATH" __poster-sweep-auto </dev/null >/dev/null 2>&1 & ) 2>/dev/null || true
+}
+
+# The background sweep: one at a time, quiet unless it cleaned or failed.
+auto_poster_sweep_locked() {
+    local min_kb
+    local output
+    min_kb="$(parse_size_kb "$POSTER_CACHE_MIN" 2>/dev/null)" || return 0
+    [[ "$min_kb" != "off" ]] || return 0
+    touch "$POSTER_STAMP_PATH" 2>/dev/null || true
+    output="$(run_poster_sweep false "$min_kb" 2>&1 || true)"
+    log_poster_clean sweep "$output"
+}
+
 main() {
     require_command install
     require_command jq
@@ -2553,13 +2917,18 @@ main() {
     require_command uuidgen
 
     case "${1:-}" in
-        acquire) shift; acquire_lease "$@"; start_auto_prune; start_clone_sweep ;;
+        acquire) shift; acquire_lease "$@"; start_auto_prune; start_clone_sweep; start_poster_sweep ;;
         status|list) shift; status_leases "$@" ;;
         renew) shift; renew_lease "$@" ;;
-        release) shift; release_lease "$@"; start_auto_prune; start_clone_sweep ;;
+        release) shift; release_lease "$@"; start_auto_prune; start_clone_sweep; start_poster_sweep ;;
         exec) shift; execute_with_lease "$@" ;;
         prune) shift; prune_derived_data "$@" ;;
         sweep-clones) shift; sweep_test_clones "$@" ;;
+        clean-posters) shift; clean_posters_command "$@" ;;
+        __clean-posters-device) shift; initialize_directories; clean_poster_cache "$@" ;;
+        __clean-posters-sweep) shift; initialize_directories; hand_poster_sweep "$@" ;;
+        __poster-sweep-auto) initialize_directories; lockf -t 0 -k "$POSTER_LOCK_PATH" "$SCRIPT_PATH" __poster-sweep-auto-locked >/dev/null 2>&1 || true ;;
+        __poster-sweep-auto-locked) initialize_directories; auto_poster_sweep_locked ;;
         __sweep-clones) shift; initialize_directories; run_clone_sweep "$@" ;;
         __sweep-clones-auto) initialize_directories; lockf -t 0 -k "$TEST_CLONE_LOCK_PATH" "$SCRIPT_PATH" __sweep-clones-auto-locked >/dev/null 2>&1 || true ;;
         __sweep-clones-auto-locked) initialize_directories; auto_clone_sweep_locked ;;

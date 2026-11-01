@@ -21,6 +21,10 @@ export SIMLEASE_AUTO_PRUNE=0
 # only the clone tests name a fake simctl.
 export SIMLEASE_CLONE_SWEEP=0
 unset SIMLEASE_SIMCTL SIMLEASE_TEST_DEVICE_SET_DIR SIMLEASE_TEST_PS SIMLEASE_TEST_CLONE_MIN_AGE SIMLEASE_CLONE_SWEEP_INTERVAL
+# And for wallpaper cache cleaning: only the poster tests turn it on, on fake
+# device folders.
+export SIMLEASE_POSTER_CLEAN=0
+unset SIMLEASE_TEST_SIMULATOR_DEVICES_DIR SIMLEASE_POSTER_CACHE_MIN SIMLEASE_POSTER_SWEEP_INTERVAL
 mkdir -p "$SIMLEASE_SERVE_SIM_STATE_DIR" "$SIMLEASE_WORKSPACE"
 
 # macOS /bin/bash 3.2 ignores `set -e` when `[[ ... ]]` fails, so every
@@ -995,6 +999,230 @@ SH
     SIMLEASE_CLONE_SWEEP=1 SIMLEASE_CLONE_SWEEP_INTERVAL=1h "$LEASE_TOOL" release --token "$(jq -r '.token' <<<"$CLONE_LEASE")" >/dev/null
     sleep 2
     [[ -d "${SIMLEASE_TEST_DEVICE_SET_DIR}/${SWEPT}" ]] || fail 'a background clone sweep ran again within SIMLEASE_CLONE_SWEEP_INTERVAL'
+)
+
+# clean-posters: iOS wallpaper preview caches in fake Simulator folders. Each
+# fake device.plist gives a state (1 shut down, 3 booted); a lease's boot is a
+# marker file, as in the scaling tests.
+(
+    POSTER_ROOT="${TEST_ROOT}/posters"
+    export SIMLEASE_DIR="${POSTER_ROOT}/leases"
+    export SIMLEASE_TEST_SIMULATOR_DEVICES_DIR="${POSTER_ROOT}/Devices"
+    export SIMLEASE_TEST_DEVICE_STATE_DIR="${POSTER_ROOT}/device-state"
+    export SIMLEASE_TEST_TOTAL_MEMORY_MB=32768
+    export SIMLEASE_TEST_FREE_MEMORY_PERCENT=50
+    export SIMLEASE_MAX_BOOTED_SIMULATORS=4
+    export SIMLEASE_POSTER_CACHE_MIN=1M
+    # Only the background test below lets acquire and release start a sweep.
+    export SIMLEASE_POSTER_SWEEP_INTERVAL=off
+    POSTER_LOG="${SIMLEASE_DIR}/poster-cache.log"
+    BIG='B0000000-0000-0000-0000-000000000001'
+    SMALL='B0000000-0000-0000-0000-000000000002'
+    BOOTED='B0000000-0000-0000-0000-000000000003'
+    PINNED='B0000000-0000-0000-0000-000000000004'
+    NONE='B0000000-0000-0000-0000-000000000005'
+    LEASED='B0000000-0000-0000-0000-000000000006'
+    IDLE='B0000000-0000-0000-0000-000000000007'
+    export SIMLEASE_SHUTDOWN_DEVICES="${LEASED}"$'\tiPhone Poster Lease'
+    mkdir -p "$SIMLEASE_TEST_DEVICE_STATE_DIR" "$SIMLEASE_CONFIG_DIR"
+    printf '%s  # signed in\n' "$PINNED" > "${SIMLEASE_CONFIG_DIR}/pinned"
+    POSTER_TOKEN=''
+    trap '[[ -z "$POSTER_TOKEN" ]] || "$LEASE_TOOL" release --token "$POSTER_TOKEN" >/dev/null 2>&1 || true; rm -f "${SIMLEASE_CONFIG_DIR}/pinned"' EXIT
+
+    store_of() { printf '%s/%s/data/Library/Application Support/PRBPosterExtensionDataStore/61' "$SIMLEASE_TEST_SIMULATOR_DEVICES_DIR" "$1"; }
+    config_of() { printf '%s/Extensions/com.apple.MercuryPoster/configurations/C0000000-0000-0000-0000-000000000001' "$(store_of "$1")"; }
+    gallery_cache_of() { printf '%s/Extensions/com.apple.EmojiPoster.EmojiPosterExtension/descriptors/D0000000-0000-0000-0000-000000000001/versions/1/scratch/SnapshotCache.cachedb' "$(store_of "$1")"; }
+    chosen_cache_of() { printf '%s/versions/0/scratch/SnapshotCache.cachedb' "$(config_of "$1")"; }
+    # A Simulator folder: UDID, name, state, then KiB of cache in each of its two
+    # caches (a gallery preview and the chosen wallpaper's), or "none" for no
+    # wallpaper store at all.
+    fake_poster_device() {
+        local device="${SIMLEASE_TEST_SIMULATOR_DEVICES_DIR}/$1"
+        local store
+        mkdir -p "$device"
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>UDID</key><string>%s</string><key>name</key><string>%s</string><key>state</key><integer>%s</integer></dict></plist>\n' \
+            "$1" "$2" "$3" > "${device}/device.plist"
+        [[ "$4" != "none" ]] || return 0
+        store="$(store_of "$1")"
+        mkdir -p "${store}/GalleryCache/PRPosterRoleLockScreen" "$(config_of "$1")/versions/0"
+        printf 'db' > "${store}/PBFPosterExtensionDataStoreSQLiteDatabase.sqlite3"
+        printf 'layout' > "${store}/GalleryCache/PRPosterRoleLockScreen/1792880002.788442.plist"
+        # The chosen wallpaper: its settings and lock and home screen pictures.
+        printf 'settings' > "$(config_of "$1")/providerInfo.plist"
+        printf 'picture' > "$(config_of "$1")/versions/0/RuntimeSnapshot-0073ad-home.atx"
+        # An empty cache, and a cache folder where iOS keeps none: both stay.
+        mkdir -p "${store}/Extensions/com.apple.ClockPoster.ClockPosterExtension/configurations/C0000000-0000-0000-0000-000000000002/versions/3/scratch/SnapshotCache.cachedb"
+        mkdir -p "${store}/Extensions/com.apple.Other/SnapshotCache.cachedb"
+        printf 'x' > "${store}/Extensions/com.apple.Other/SnapshotCache.cachedb/keep"
+        fake_poster_cache "$1" "$4"
+    }
+    # Fills both caches with KiB each, and writes the two index files.
+    fake_poster_cache() {
+        local store
+        local cache
+        store="$(store_of "$1")"
+        for cache in "$(gallery_cache_of "$1")" "$(chosen_cache_of "$1")"; do
+            mkdir -p "${cache}/PosterSnapshotCache.bundle/SnapshotBundles/E0000000-0000-0000-0000-000000000001"
+            printf 'db' > "${cache}/PosterSnapshotCache.bundle/cache.db"
+            dd if=/dev/urandom of="${cache}/PosterSnapshotCache.bundle/SnapshotBundles/E0000000-0000-0000-0000-000000000001/Snapshot.pks" \
+                bs=1024 count="$2" 2>/dev/null
+        done
+        printf '{"experience":"gallery"}' > "${store}/PRPosterRoleLockScreen-gallery-index.json"
+        printf '{"experience":"switcher"}' > "${store}/PRPosterRoleLockScreen-switcher-index.json"
+    }
+    has_caches() { [[ -e "$(gallery_cache_of "$1")" || -e "$(chosen_cache_of "$1")" ]]; }
+    has_all_caches() {
+        [[ -d "$(gallery_cache_of "$1")" && -d "$(chosen_cache_of "$1")" \
+            && -f "$(store_of "$1")/PRPosterRoleLockScreen-gallery-index.json" \
+            && -f "$(store_of "$1")/PRPosterRoleLockScreen-switcher-index.json" ]]
+    }
+    # Everything that is not a cache is still there.
+    kept_the_rest() {
+        local store
+        store="$(store_of "$1")"
+        [[ -f "$(config_of "$1")/providerInfo.plist" && -f "$(config_of "$1")/versions/0/RuntimeSnapshot-0073ad-home.atx" \
+            && -f "${store}/PBFPosterExtensionDataStoreSQLiteDatabase.sqlite3" \
+            && -f "${store}/GalleryCache/PRPosterRoleLockScreen/1792880002.788442.plist" \
+            && -d "$(dirname "$(gallery_cache_of "$1")")" && -d "$(dirname "$(chosen_cache_of "$1")")" \
+            && -d "${store}/Extensions/com.apple.ClockPoster.ClockPosterExtension/configurations/C0000000-0000-0000-0000-000000000002/versions/3/scratch/SnapshotCache.cachedb" \
+            && -f "${store}/Extensions/com.apple.Other/SnapshotCache.cachedb/keep" \
+            && ! -e "${SIMLEASE_TEST_SIMULATOR_DEVICES_DIR}/$1/data/Library/Application Support/.simlease-poster-trash" ]]
+    }
+    # What clean-posters printed for a UDID, as action/reason, or nothing.
+    poster_state() {
+        awk -F '\t' -v udid="$2" '$4 == udid { print $1 "/" $2 }' <<<"$1"
+    }
+    # Waits for the guard of a lease that ended: it holds the Simulator's lock
+    # while it cleans.
+    wait_for_guard() {
+        lockf -k -t 15 "${SIMLEASE_DIR}/locks/$1.lock" true || fail "the lease guard of $1 did not finish"
+    }
+
+    fake_poster_device "$BIG" 'iPhone Big' 1 1024
+    fake_poster_device "$SMALL" 'iPhone Small' 1 4
+    fake_poster_device "$BOOTED" 'iPhone Booted' 3 1024
+    fake_poster_device "$PINNED" 'iPhone Pinned' 1 1024
+    fake_poster_device "$NONE" 'iPhone No Store' 1 none
+    fake_poster_device "$LEASED" 'iPhone Poster Lease' 1 1024
+    fake_poster_device "$IDLE" 'iPhone Idle' 1 1024
+
+    "$LEASE_TOOL" clean-posters --min-size soon >/dev/null 2>&1 && fail 'clean-posters accepted a size it cannot read'
+    "$LEASE_TOOL" clean-posters --all >/dev/null 2>&1 && fail 'clean-posters accepted an unknown option'
+    "$LEASE_TOOL" clean-posters --token not-a-lease >/dev/null 2>&1 && fail 'clean-posters accepted a token with no lease'
+
+    POSTER_OUTPUT="$("$LEASE_TOOL" clean-posters --min-size 1M --dry-run)"
+    [[ "$(poster_state "$POSTER_OUTPUT" "$BIG")" == 'would-clean/wallpaper-cache' ]] || fail 'clean-posters --dry-run did not list a shut-down Simulator with 2 MB of cache'
+    [[ "$(poster_state "$POSTER_OUTPUT" "$SMALL")" == 'kept/small' ]] || fail 'clean-posters --dry-run did not keep a cache below --min-size'
+    [[ "$(poster_state "$POSTER_OUTPUT" "$BOOTED")" == 'kept/booted' ]] || fail 'clean-posters --dry-run did not keep a booted Simulator'
+    [[ "$(poster_state "$POSTER_OUTPUT" "$PINNED")" == 'kept/pinned' ]] || fail 'clean-posters --dry-run did not keep a pinned Simulator'
+    [[ -z "$(poster_state "$POSTER_OUTPUT" "$NONE")" ]] || fail 'clean-posters --dry-run listed a Simulator with no wallpaper store'
+    grep -q $'\t2 caches, 2 index files$' <<<"$POSTER_OUTPUT" || fail 'clean-posters --dry-run did not count the caches and index files'
+    grep -q 'Nothing was deleted' <<<"$POSTER_OUTPUT" || fail 'clean-posters --dry-run did not say that nothing was deleted'
+    has_all_caches "$BIG" || fail 'clean-posters --dry-run deleted something'
+    [[ ! -e "$POSTER_LOG" ]] || fail 'clean-posters --dry-run wrote to the log'
+
+    # A Simulator a lease holds is left alone by the sweep.
+    POSTER_LEASE="$(SIMLEASE_POSTER_CLEAN=0 "$LEASE_TOOL" acquire --owner posters --device "$LEASED" --boot-if-needed --ttl 60 --json)"
+    POSTER_TOKEN="$(jq -r '.token' <<<"$POSTER_LEASE")"
+    rm -f "${SIMLEASE_TEST_DEVICE_STATE_DIR}/${LEASED}.booted"
+    POSTER_OUTPUT="$("$LEASE_TOOL" clean-posters --min-size 1M)"
+    [[ "$(poster_state "$POSTER_OUTPUT" "$BIG")" == 'cleaned/wallpaper-cache' ]] || fail 'clean-posters did not clean a shut-down Simulator'
+    ! has_caches "$BIG" || fail 'clean-posters left a cache behind'
+    [[ ! -e "$(store_of "$BIG")/PRPosterRoleLockScreen-gallery-index.json" && ! -e "$(store_of "$BIG")/PRPosterRoleLockScreen-switcher-index.json" ]] \
+        || fail 'clean-posters left an index file that points into the deleted caches'
+    kept_the_rest "$BIG" || fail 'clean-posters deleted something that is not a wallpaper cache'
+    has_all_caches "$SMALL" || fail 'clean-posters cleaned a cache below --min-size'
+    has_all_caches "$BOOTED" || fail 'clean-posters touched a booted Simulator'
+    has_all_caches "$PINNED" || fail 'clean-posters touched a pinned Simulator'
+    [[ "$(poster_state "$POSTER_OUTPUT" "$LEASED")" == 'kept/leased' ]] || fail 'clean-posters did not keep a Simulator another lease holds'
+    has_all_caches "$LEASED" || fail 'clean-posters touched a Simulator another lease holds'
+    grep -q $'^cleaned\twallpaper-cache\t.*\t'"${BIG}"$'\tiPhone Big\t' "$POSTER_LOG" || fail 'clean-posters did not log what it cleaned'
+    ! grep -q -e "$SMALL" -e "$BOOTED" "$POSTER_LOG" || fail 'clean-posters logged a Simulator it kept'
+    # Without --min-size it cleans any cache.
+    POSTER_OUTPUT="$("$LEASE_TOOL" clean-posters)"
+    [[ "$(poster_state "$POSTER_OUTPUT" "$SMALL")" == 'cleaned/wallpaper-cache' ]] || fail 'clean-posters without --min-size kept a small cache'
+    ! has_caches "$SMALL" || fail 'clean-posters without --min-size left a small cache behind'
+    kept_the_rest "$SMALL" || fail 'clean-posters deleted something that is not a wallpaper cache'
+
+    # With a token: only the leased Simulator, and only once it is shut down.
+    POSTER_OUTPUT="$("$LEASE_TOOL" clean-posters --token "$POSTER_TOKEN" --dry-run)"
+    [[ "$(poster_state "$POSTER_OUTPUT" "$LEASED")" == 'would-clean/wallpaper-cache' ]] || fail 'clean-posters --token --dry-run did not list the leased Simulator'
+    has_all_caches "$LEASED" || fail 'clean-posters --token --dry-run deleted something'
+    : > "${SIMLEASE_TEST_DEVICE_STATE_DIR}/${LEASED}.booted"
+    "$LEASE_TOOL" clean-posters --token "$POSTER_TOKEN" >/dev/null 2>&1 && fail 'clean-posters cleaned a booted leased Simulator'
+    has_all_caches "$LEASED" || fail 'clean-posters touched a booted leased Simulator'
+    rm -f "${SIMLEASE_TEST_DEVICE_STATE_DIR}/${LEASED}.booted"
+    POSTER_OUTPUT="$("$LEASE_TOOL" clean-posters --token "$POSTER_TOKEN")"
+    [[ "$(poster_state "$POSTER_OUTPUT" "$LEASED")" == 'cleaned/wallpaper-cache' ]] || fail 'clean-posters --token did not clean the shut-down leased Simulator'
+    ! has_caches "$LEASED" || fail 'clean-posters --token left a cache behind'
+    kept_the_rest "$LEASED" || fail 'clean-posters --token deleted something that is not a wallpaper cache'
+    [[ "$("$LEASE_TOOL" clean-posters --token "$POSTER_TOKEN")" == 'No wallpaper caches on iPhone Poster Lease.' ]] \
+        || fail 'clean-posters --token did not say there was nothing to clean'
+    "$LEASE_TOOL" release --token "$POSTER_TOKEN" >/dev/null
+    POSTER_TOKEN=''
+    wait_for_guard "$LEASED"
+
+    # The guard keeps the SIMLEASE_POSTER_CLEAN its acquire had. Off: it cleans
+    # neither before the boot nor after the shutdown.
+    fake_poster_cache "$LEASED" 1024
+    POSTER_LEASE="$(SIMLEASE_POSTER_CLEAN=0 "$LEASE_TOOL" acquire --owner posters --device "$LEASED" --boot-if-needed --ttl 60 --json)"
+    POSTER_TOKEN="$(jq -r '.token' <<<"$POSTER_LEASE")"
+    has_all_caches "$LEASED" || fail 'acquire cleaned caches with SIMLEASE_POSTER_CLEAN=0'
+    "$LEASE_TOOL" release --token "$POSTER_TOKEN" >/dev/null
+    POSTER_TOKEN=''
+    wait_for_guard "$LEASED"
+    has_all_caches "$LEASED" || fail 'release cleaned caches with SIMLEASE_POSTER_CLEAN=0'
+
+    # Acquire: the guard cleans a shut-down Simulator before it boots it.
+    POSTER_LEASE="$(SIMLEASE_POSTER_CLEAN=1 "$LEASE_TOOL" acquire --owner posters --device "$LEASED" --boot-if-needed --ttl 60 --json)"
+    POSTER_TOKEN="$(jq -r '.token' <<<"$POSTER_LEASE")"
+    [[ "$(jq -r '.bootedBySimLease' <<<"$POSTER_LEASE")" == 'true' && -f "${SIMLEASE_TEST_DEVICE_STATE_DIR}/${LEASED}.booted" ]] \
+        || fail 'the poster lease did not boot its Simulator'
+    ! has_caches "$LEASED" || fail 'acquire did not clean the Simulator before it booted it'
+    kept_the_rest "$LEASED" || fail 'acquire deleted something that is not a wallpaper cache'
+    grep -q 'boot$' "$POSTER_LOG" || fail 'the boot clean did not log under "boot"'
+    # Release: the guard cleans what this boot drew, once it has shut the Simulator down.
+    fake_poster_cache "$LEASED" 1024
+    "$LEASE_TOOL" release --token "$POSTER_TOKEN" >/dev/null
+    POSTER_TOKEN=''
+    wait_for_guard "$LEASED"
+    ! has_caches "$LEASED" || fail 'release did not clean the Simulator it shut down'
+    kept_the_rest "$LEASED" || fail 'release deleted something that is not a wallpaper cache'
+    grep -q 'release$' "$POSTER_LOG" || fail 'the release clean did not log under "release"'
+
+    # Release leaves a cache below SIMLEASE_POSTER_CACHE_MIN.
+    POSTER_LEASE="$(SIMLEASE_POSTER_CLEAN=1 "$LEASE_TOOL" acquire --owner posters --device "$LEASED" --boot-if-needed --ttl 60 --json)"
+    POSTER_TOKEN="$(jq -r '.token' <<<"$POSTER_LEASE")"
+    fake_poster_cache "$LEASED" 4
+    "$LEASE_TOOL" release --token "$POSTER_TOKEN" >/dev/null
+    POSTER_TOKEN=''
+    wait_for_guard "$LEASED"
+    has_all_caches "$LEASED" || fail 'release cleaned a cache below SIMLEASE_POSTER_CACHE_MIN'
+
+    # In the background after release, at most once every SIMLEASE_POSTER_SWEEP_INTERVAL.
+    fake_poster_device "$IDLE" 'iPhone Idle' 1 1024
+    POSTER_LEASE="$("$LEASE_TOOL" acquire --owner posters --ttl 30 --json)"
+    SIMLEASE_POSTER_CLEAN=1 SIMLEASE_POSTER_SWEEP_INTERVAL=0 "$LEASE_TOOL" release --token "$(jq -r '.token' <<<"$POSTER_LEASE")" >/dev/null
+    for _ in $(seq 1 100); do
+        ! has_caches "$IDLE" && break
+        sleep 0.1
+    done
+    lockf -t 15 "${SIMLEASE_DIR}/locks/poster-cache-sweep.lock" true || fail 'the background poster sweep did not finish'
+    ! has_caches "$IDLE" || fail 'release did not clean an idle Simulator in the background'
+    kept_the_rest "$IDLE" || fail 'the background poster sweep deleted something that is not a wallpaper cache'
+    grep -q 'sweep$' "$POSTER_LOG" || fail 'the background poster sweep did not log under "sweep"'
+    grep -q $'\t'"${IDLE}"$'\tiPhone Idle\t' "$POSTER_LOG" || fail 'the background poster sweep did not log what it cleaned'
+    has_all_caches "$BOOTED" || fail 'the background poster sweep touched a booted Simulator'
+    has_all_caches "$PINNED" || fail 'the background poster sweep touched a pinned Simulator'
+    fake_poster_cache "$IDLE" 1024
+    POSTER_LEASE="$("$LEASE_TOOL" acquire --owner posters --ttl 30 --json)"
+    SIMLEASE_POSTER_CLEAN=1 SIMLEASE_POSTER_SWEEP_INTERVAL=1h "$LEASE_TOOL" release --token "$(jq -r '.token' <<<"$POSTER_LEASE")" >/dev/null
+    sleep 2
+    has_all_caches "$IDLE" || fail 'a background poster sweep ran again within SIMLEASE_POSTER_SWEEP_INTERVAL'
+
+    # The tests' fake Simulators never reach the real device folders.
+    [[ "$(SIMLEASE_TEST_SIMULATOR_DEVICES_DIR='' "$LEASE_TOOL" clean-posters --dry-run)" == Skipped:* ]] \
+        || fail 'clean-posters ran with fake Simulators and no fake device folders'
 )
 
 printf 'simulator lease tests passed\n'
